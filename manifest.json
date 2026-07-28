@@ -1,0 +1,75 @@
+{
+  "id": "com.universaltill.tax-de",
+  "name": "Germany Fiscal Compliance (TSE + DSFinV-K)",
+  "version": "0.1.0",
+  "description": "Starting-point integration against fiskaly's Cloud-TSE (SIGN DE) API for KassenSichV transaction signing and fiskaly's DSFinV-K export API for tax-audit exports. Starting skeleton: NOT tested against a real fiskaly account, NOT legally verified for DSFinV-K compliance, and NOT a substitute for tax-advisor sign-off before any merchant relies on it. See README before installing.",
+  "author": "Universal Till",
+  "website": "https://universaltill.com",
+  "canonical_type": "tax",
+  "runtime": "wasm",
+  "device_arch": "any",
+  "min_pos_version": "1.0.0",
+  "countries": ["DE"],
+  "permissions": [
+    "events:receive",
+    "net:kassensichv.io",
+    "storage"
+  ],
+  "locales": [
+    "en-US",
+    "de-DE"
+  ],
+  "entries": [
+    {
+      "type": "tax",
+      "key": "tse-sign-de",
+      "label": "TSE Signing (fiskaly Cloud-TSE)",
+      "sort_order": 5
+    },
+    {
+      "type": "export",
+      "key": "dsfinvk-export-de",
+      "label": "DSFinV-K Export (fiskaly)",
+      "sort_order": 10
+    }
+  ],
+  "settings": [
+    {
+      "key": "fiskaly_api_key",
+      "default_value": "",
+      "scope": "global"
+    },
+    {
+      "key": "fiskaly_api_secret",
+      "default_value": "",
+      "scope": "global"
+    },
+    {
+      "key": "fiskaly_tss_id",
+      "default_value": "",
+      "scope": "global"
+    },
+    {
+      "key": "fiskaly_client_id",
+      "default_value": "",
+      "scope": "register"
+    },
+    {
+      "key": "fiskaly_cash_register_id",
+      "default_value": "",
+      "scope": "global"
+    },
+    {
+      "key": "dsfinvk_export_format",
+      "default_value": "zip",
+      "scope": "global"
+    }
+  ],
+  "entrypoint": "./bin/plugin.wasm",
+  "hooks": [
+    {
+      "event": "sale.completed",
+      "action": "tse.sign"
+    }
+  ]
+}
