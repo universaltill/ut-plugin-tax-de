@@ -543,6 +543,60 @@ func handleSaleCompleted(raw []byte) {
 	os.Exit(0)
 }
 
+// taxRateAskPayload mirrors universal-till's internal/pages/tax_hook.go —
+// the till's core has NO built-in notion of §12 UStG's dine-in/takeaway
+// VAT switch; this plugin is where that rule actually lives.
+type taxRateAskPayload struct {
+	ItemID    string `json:"item_id"`
+	TaxCodeID string `json:"tax_code_id"`
+	TaxRateBP int    `json:"tax_rate_bp"`
+	OrderType string `json:"order_type"`
+}
+
+// handleTaxRateAsk answers the "tax.rate.ask" hook (EventBus.Ask — a
+// blocking, value-returning hook; see universal-till's
+// internal/plugins/ipc.go doc comment). Writing valid JSON to stdout is the
+// answer; writing nothing means "no opinion on this line," and the till
+// falls back to the line's own configured rate.
+//
+// The actual rule — which tax codes switch to which reduced rate on
+// takeaway — is merchant-configured via the takeaway_rate_overrides
+// setting (a JSON object, tax_code_id → basis points), NOT hardcoded here:
+// a real German café's catalog varies (e.g. only some drinks, not food),
+// and this plugin has no way to know a shop's own tax-code IDs in advance.
+// There is currently no dedicated settings UI for this beyond editing the
+// JSON value directly (same pre-existing gap noted in universal-till's
+// docs/code-reviews/2026-07-28-order-type-tax-switching.md, now on the
+// plugin side instead of core's) — a real follow-up, not built here.
+func handleTaxRateAsk(raw []byte) {
+	var wrapper struct {
+		Payload json.RawMessage `json:"payload"`
+	}
+	_ = json.Unmarshal(raw, &wrapper)
+	var ask taxRateAskPayload
+	_ = json.Unmarshal(wrapper.Payload, &ask)
+
+	if ask.OrderType != "takeaway" {
+		os.Exit(0) // dine-in/standard: this plugin has no opinion, use the line's own rate
+	}
+
+	overrides := map[string]int{}
+	if raw := strings.TrimSpace(setting("takeaway_rate_overrides")); raw != "" {
+		if err := json.Unmarshal([]byte(raw), &overrides); err != nil {
+			logf("tax-de: takeaway_rate_overrides setting is not valid JSON: %v", err)
+			os.Exit(0)
+		}
+	}
+
+	bp, ok := overrides[ask.TaxCodeID]
+	if !ok || bp <= 0 {
+		os.Exit(0) // no override configured for this tax code — stays pinned to its own rate
+	}
+
+	fmt.Print(string(mustJSON(map[string]int{"rate_bp": bp})))
+	os.Exit(0)
+}
+
 // recordResult persists the sign attempt's outcome (signed or not) keyed by
 // sale id, so a future report/reconciliation surface can enumerate unsigned
 // sales. Deliberately separate from the retry queue: this is a permanent
@@ -627,6 +681,9 @@ func main() {
 	switch {
 	case ev.Type == "sale.completed":
 		handleSaleCompleted(raw)
+
+	case ev.Type == "tax.rate.ask":
+		handleTaxRateAsk(raw)
 
 	// Custom, NOT-YET-WIRED event: no dispatcher in universal-till calls
 	// canonical_type "export" plugins today (see exportDSFinVK's doc

@@ -63,6 +63,11 @@
       "key": "dsfinvk_export_format",
       "default_value": "zip",
       "scope": "global"
+    },
+    {
+      "key": "takeaway_rate_overrides",
+      "default_value": "{}",
+      "scope": "global"
     }
   ],
   "entrypoint": "./bin/plugin.wasm",
@@ -70,6 +75,10 @@
     {
       "event": "sale.completed",
       "action": "tse.sign"
+    },
+    {
+      "event": "tax.rate.ask",
+      "action": "tax.rate"
     }
   ]
 }

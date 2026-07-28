@@ -57,7 +57,9 @@ context for whoever wires the dispatcher up.
 ## Code layout
 
 - `src/main.go` — single WASI command, dispatches on the event JSON's
-  `type` field (`sale.completed` → `handleSaleCompleted`; the placeholder
+  `type` field (`sale.completed` → `handleSaleCompleted`; `tax.rate.ask` →
+  `handleTaxRateAsk`, the dine-in/takeaway VAT switch, verified against a
+  real wazero run — see README's status table; the placeholder
   export-request type → `exportDSFinVK`).
 - Host functions imported from module `ut` (see docs repo
   `reference/plugin-host-functions.md`): `log_write`, `settings_get`,

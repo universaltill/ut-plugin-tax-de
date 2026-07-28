@@ -22,7 +22,7 @@ vs. "researched, not tested":
 | DSFinV-K export format/content is legally compliant | **Not verified, at all.** No DSFinV-K output from this plugin has been checked against the DSFinV-K spec or a real tax audit. |
 | KassenSichV compliance overall | **Not certified.** This is a starting skeleton. A merchant must get real legal/tax-advisor sign-off before relying on this for a live business — this plugin existing does not make a till KassenSichV-compliant. |
 | `go build ./...` / `scripts/build.sh` | **Confirmed** — builds clean as of this commit (see CI). |
-| End-to-end behavior against the till's real event bus | **Not verified.** Unlike `ut-plugin-payment-sumup` (which was run against the real wazero host runtime before shipping), this plugin has NOT been exercised against `universal-till`'s actual `WasmRuntime.HandleEvent` — say so plainly rather than claim it works. |
+| End-to-end behavior against the till's real event bus | **Partially verified.** The `sale.completed`/TSE-signing path has NOT been exercised against `universal-till`'s actual `WasmRuntime.HandleEvent`. The `tax.rate.ask` handler HAS been run against the compiled `bin/plugin.wasm` through a real wazero runtime (same engine `universal-till` uses) with a minimal host-function stub — verified event dispatch, a settings lookup, and the exact stdout JSON shape core expects, for all three cases (dine-in declines, takeaway with a configured override answers, takeaway with no override declines). That stub is NOT `universal-till`'s actual host function implementations or a real installed-plugin flow through the till's UI — closer than untested, not the same as verified live. |
 
 ## What this plugin does
 
@@ -37,6 +37,16 @@ needed, ADR-0002's `tax`/`export` types already exist):
 - **`export` — DSFinV-K export.** Calls fiskaly's DSFinV-K API to trigger an
   export for a date range. **Not wired to any till UI** — see "Known gaps"
   below.
+- **Dine-in/takeaway VAT rate switching (§12 UStG).** Subscribes to
+  `tax.rate.ask` — a generic, blocking, value-returning hook
+  (`EventBus.Ask`) universal-till's core added specifically so this rule
+  didn't have to live in core itself (see `universal-till`'s
+  `docs/code-reviews/2026-07-28-tax-rate-plugin-hook-refactor.md`). Core
+  asks this plugin "what's the rate for this line, given this order type";
+  `handleTaxRateAsk` in `src/main.go` answers from the merchant-configured
+  `takeaway_rate_overrides` setting (tax_code_id → basis points) when the
+  order type is takeaway, or declines (writes nothing) for dine-in or an
+  unconfigured tax code — core then falls back to the line's own rate.
 
 ## Known gaps (read before assuming this "just works")
 
@@ -132,6 +142,11 @@ Every one of the above is also flagged `NEEDS SANDBOX VERIFICATION` at its
 definition in `src/main.go` — the code comments are the source of truth if
 this README drifts.
 
+**`handleTaxRateAsk` (dine-in/takeaway VAT switching) is real, and is the
+one piece of this plugin actually verified against a real wazero-compiled
+run** (see the status table above) — no fiskaly dependency, so nothing
+about it needed a sandbox account.
+
 ## Configure (plugin settings)
 
 - `fiskaly_api_key` / `fiskaly_api_secret` — the merchant's fiskaly API
@@ -148,6 +163,10 @@ this README drifts.
   fiskaly accounts share one id across both APIs, some don't; verify
   against the merchant's account).
 - `dsfinvk_export_format` — `zip` (default) or `tar`.
+- `takeaway_rate_overrides` — JSON object, tax_code_id → basis points, e.g.
+  `{"tax-drink-de": 700}` for a drinks tax code that should be 7% on
+  takeaway. Edited as raw JSON — there is no dedicated form for this yet
+  (see "What a human still needs to do" below).
 
 ## What a human still needs to do before this could ever go live
 
@@ -165,9 +184,14 @@ this README drifts.
    DSFinV-K export is actually complete, and wire canonical_type `export`
    into an actual dispatcher/UI trigger in `universal-till` (Known gaps #2)
    so a merchant can run one.
-5. **Test against the real wazero host runtime**, not just `go build` — the
-   way `ut-plugin-payment-sumup` was verified before its reader-checkout
-   path shipped.
+5. **Test the TSE/DSFinV-K paths against the real wazero host runtime**,
+   not just `go build` — the way `ut-plugin-payment-sumup` was verified
+   before its reader-checkout path shipped, and the way `tax.rate.ask` now
+   has been (see the status table).
+6. **Build a settings UI for `takeaway_rate_overrides`** — today it's a raw
+   JSON text field, no form to pick a tax code from the shop's actual
+   catalog and set its takeaway rate. A real merchant can't use this
+   feature without either that UI or editing plugin settings by hand.
 
 ## Build
 
