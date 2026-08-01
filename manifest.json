@@ -1,8 +1,8 @@
 {
   "id": "com.universaltill.tax-de",
   "name": "Germany Fiscal Compliance (TSE + DSFinV-K)",
-  "version": "0.2.0",
-  "description": "Starting-point integration against fiskaly's Cloud-TSE (SIGN DE) API for KassenSichV transaction signing and fiskaly's DSFinV-K export API for tax-audit exports. Starting skeleton: NOT tested against a real fiskaly account, NOT legally verified for DSFinV-K compliance, and NOT a substitute for tax-advisor sign-off before any merchant relies on it. See README before installing.",
+  "version": "0.3.0",
+  "description": "Starting-point integration against fiskaly's Cloud-TSE (SIGN DE) API for KassenSichV transaction signing, fiskaly's DSFinV-K export API for tax-audit exports, and a DATEV EXTF Buchungsstapel export for handing sales to an accountant. Starting skeleton: NOT tested against a real fiskaly account, NOT legally verified for DSFinV-K compliance, chart-of-accounts mapping for the DATEV export is merchant/accountant-configured (no defaults assumed), and none of this is a substitute for tax-advisor sign-off before any merchant relies on it. See README before installing.",
   "author": "Universal Till",
   "website": "https://universaltill.com",
   "canonical_type": "tax",
@@ -31,6 +31,12 @@
       "key": "dsfinvk-export-de",
       "label": "DSFinV-K Export (fiskaly)",
       "sort_order": 10
+    },
+    {
+      "type": "export",
+      "key": "datev-buchungsstapel-export-de",
+      "label": "DATEV Buchungsstapel Export (EXTF)",
+      "sort_order": 15
     }
   ],
   "settings": [
@@ -66,6 +72,41 @@
     },
     {
       "key": "takeaway_rate_overrides",
+      "default_value": "{}",
+      "scope": "global"
+    },
+    {
+      "key": "datev_berater_nr",
+      "default_value": "",
+      "scope": "global"
+    },
+    {
+      "key": "datev_mandant_nr",
+      "default_value": "",
+      "scope": "global"
+    },
+    {
+      "key": "datev_sachkontenlaenge",
+      "default_value": "4",
+      "scope": "global"
+    },
+    {
+      "key": "datev_wj_beginn",
+      "default_value": "0101",
+      "scope": "global"
+    },
+    {
+      "key": "datev_konto_kasse",
+      "default_value": "",
+      "scope": "global"
+    },
+    {
+      "key": "datev_erloeskonten",
+      "default_value": "{}",
+      "scope": "global"
+    },
+    {
+      "key": "datev_bu_schluessel",
       "default_value": "{}",
       "scope": "global"
     }

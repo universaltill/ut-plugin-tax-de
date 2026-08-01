@@ -52,6 +52,8 @@ import (
 	"strings"
 	"time"
 	"unsafe"
+
+	"github.com/universaltill/ut-plugin-tax-de/src/datev"
 )
 
 // --- host functions (module "ut", see ut-docs reference/plugin-host-functions.md) ---
@@ -101,6 +103,10 @@ const dsfinvkBase = "https://kassensichv.io/api/v1/dsfinvk"
 // for cross-plugin routing (that's the host's job, see universal-till's
 // EventBus.AskPlugin).
 const dsfinvkExportEntryKey = "dsfinvk-export-de"
+
+// datevExportEntryKey must match manifest.json's second "export" entries[]
+// item — see dsfinvkExportEntryKey's doc comment for why this check exists.
+const datevExportEntryKey = "datev-buchungsstapel-export-de"
 
 const (
 	unsignedQueueKey = "unsigned_queue" // storage key: sales that failed to sign, pending retry
@@ -679,6 +685,88 @@ func exportDSFinVK(fromDate, toDate string) (ok bool, downloadInfo string) {
 	return true, exportResp.ID
 }
 
+// handleDSFinVKExport answers export.requested.ask for the dsfinvk-export-de
+// entry — extracted unchanged from the pre-ut-docs#41 inline handler (this
+// plugin's only export entry until the DATEV entry below was added).
+func handleDSFinVKExport(from, to string) {
+	ok, info := exportDSFinVK(from, to)
+	logf("tax-de: dsfinvk export requested from=%s to=%s ok=%v info=%s", from, to, ok, info)
+	// This plugin only ever triggers fiskaly's async job (see
+	// exportDSFinVK's doc comment) — it never has file bytes to return
+	// inline, so the response always omits content_b64/filename.
+	if !ok {
+		fmt.Print(string(mustJSON(map[string]any{
+			"ok":    false,
+			"error": "DSFinV-K export trigger failed (not configured, or fiskaly auth/request error — see plugin logs)",
+		})))
+		os.Exit(0)
+	}
+	fmt.Print(string(mustJSON(map[string]any{
+		"ok": true,
+		"message": fmt.Sprintf(
+			"DSFinV-K export triggered (fiskaly export id=%s). This is async and can take up to an hour per fiskaly's docs — "+
+				"polling for completion is not implemented here, check the fiskaly dashboard.", info),
+	})))
+	os.Exit(0)
+}
+
+// --- DATEV Buchungsstapel export (ut-docs#41) ---
+//
+// Unlike DSFinV-K, this is pure local data transformation (internal/data.
+// ExportSaleRow -> a DATEV EXTF CSV, see src/datev) — no fiskaly account, no
+// network call, no async job. The file is built and returned inline via
+// content_b64, same request/response cycle as the till's own reset-
+// transactions/cleanup-catalog actions.
+func handleDATEVExport(from, to string, sales []datev.SaleRow) {
+	settings, err := datevSettings()
+	if err != nil {
+		logf("tax-de: datev export settings invalid: %v", err)
+		fmt.Print(string(mustJSON(map[string]any{"ok": false, "error": err.Error()})))
+		os.Exit(0)
+	}
+	result, err := datev.Build(from, to, sales, settings, time.Now().UTC())
+	if err != nil {
+		logf("tax-de: datev export failed: %v", err)
+		fmt.Print(string(mustJSON(map[string]any{"ok": false, "error": err.Error()})))
+		os.Exit(0)
+	}
+	logf("tax-de: datev export built from=%s to=%s sales=%d bytes=%d", from, to, len(sales), len(result.Content))
+	fmt.Print(string(mustJSON(map[string]any{
+		"ok":          true,
+		"filename":    result.Filename,
+		"content_b64": base64.StdEncoding.EncodeToString(result.Content),
+	})))
+	os.Exit(0)
+}
+
+// datevSettings reads and parses the datev_* plugin settings. Erloeskonten/
+// BuSchluessel are merchant/accountant-configured JSON maps (tax_rate_bp ->
+// account number) — see the datev package's Settings doc comment for why
+// this plugin never defaults them to a guessed real account number.
+func datevSettings() (datev.Settings, error) {
+	erloeskonten := map[string]string{}
+	if raw := strings.TrimSpace(setting("datev_erloeskonten")); raw != "" && raw != "{}" {
+		if err := json.Unmarshal([]byte(raw), &erloeskonten); err != nil {
+			return datev.Settings{}, fmt.Errorf("datev_erloeskonten is not valid JSON: %w", err)
+		}
+	}
+	buSchluessel := map[string]string{}
+	if raw := strings.TrimSpace(setting("datev_bu_schluessel")); raw != "" && raw != "{}" {
+		if err := json.Unmarshal([]byte(raw), &buSchluessel); err != nil {
+			return datev.Settings{}, fmt.Errorf("datev_bu_schluessel is not valid JSON: %w", err)
+		}
+	}
+	return datev.Settings{
+		BeraterNr:        strings.TrimSpace(setting("datev_berater_nr")),
+		MandantNr:        strings.TrimSpace(setting("datev_mandant_nr")),
+		SachkontenLaenge: strings.TrimSpace(setting("datev_sachkontenlaenge")),
+		WJBeginn:         strings.TrimSpace(setting("datev_wj_beginn")),
+		KontoKasse:       strings.TrimSpace(setting("datev_konto_kasse")),
+		Erloeskonten:     erloeskonten,
+		BuSchluessel:     buSchluessel,
+	}, nil
+}
+
 func main() {
 	raw, _ := io.ReadAll(os.Stdin)
 	var ev struct {
@@ -701,17 +789,28 @@ func main() {
 	// against a future second export entry in this same plugin.
 	case ev.Type == "export.requested.ask":
 		var payload struct {
-			From     string `json:"from"`
-			To       string `json:"to"`
-			EntryKey string `json:"entry_key"`
+			From     string          `json:"from"`
+			To       string          `json:"to"`
+			EntryKey string          `json:"entry_key"`
+			Sales    []datev.SaleRow `json:"sales"` // ut-docs#221 — only the DATEV path below consumes this; DSFinV-K stays fiskaly-triggered, no local data needed
 		}
 		var wrapper struct {
 			Payload json.RawMessage `json:"payload"`
 		}
-		_ = json.Unmarshal(raw, &wrapper)
-		_ = json.Unmarshal(wrapper.Payload, &payload)
-		if payload.EntryKey != "" && payload.EntryKey != dsfinvkExportEntryKey {
-			logf("tax-de: export.requested.ask for entry_key=%q, not ours (%q) — declining", payload.EntryKey, dsfinvkExportEntryKey)
+		if err := json.Unmarshal(raw, &wrapper); err != nil {
+			logf("tax-de: export.requested.ask: unparseable event envelope: %v", err)
+			fmt.Print(string(mustJSON(map[string]any{"ok": false, "error": "malformed export request"})))
+			os.Exit(0)
+		}
+		if err := json.Unmarshal(wrapper.Payload, &payload); err != nil {
+			// Reviewer-caught: this used to be a silently-ignored `_ =`,
+			// which for a DATEV request with a malformed payload fell
+			// through to payload.EntryKey == "" and got silently routed to
+			// the DSFinV-K/fiskaly path instead — a confusing "DSFinV-K
+			// export trigger failed" error for what was actually a DATEV
+			// request with a bad payload. Fail closed instead.
+			logf("tax-de: export.requested.ask: unparseable payload: %v", err)
+			fmt.Print(string(mustJSON(map[string]any{"ok": false, "error": "malformed export request payload"})))
 			os.Exit(0)
 		}
 		if payload.From == "" || payload.To == "" {
@@ -719,25 +818,21 @@ func main() {
 			payload.To = now.Format("2006-01-02")
 			payload.From = now.AddDate(0, 0, -1).Format("2006-01-02")
 		}
-		ok, info := exportDSFinVK(payload.From, payload.To)
-		logf("tax-de: dsfinvk export requested from=%s to=%s ok=%v info=%s", payload.From, payload.To, ok, info)
-		// This plugin only ever triggers fiskaly's async job (see
-		// exportDSFinVK's doc comment) — it never has file bytes to return
-		// inline, so the response always omits content_b64/filename.
-		if !ok {
-			fmt.Print(string(mustJSON(map[string]any{
-				"ok":    false,
-				"error": "DSFinV-K export trigger failed (not configured, or fiskaly auth/request error — see plugin logs)",
-			})))
+
+		switch payload.EntryKey {
+		case datevExportEntryKey:
+			handleDATEVExport(payload.From, payload.To, payload.Sales)
+		case dsfinvkExportEntryKey, "":
+			// "" (no entry_key) preserves this plugin's pre-ut-docs#41
+			// behavior, from when dsfinvk-export-de was its only export
+			// entry — the host always sends a real entry_key today
+			// (internal/pages/data_api.go resolves it before asking), this
+			// is defensive only.
+			handleDSFinVKExport(payload.From, payload.To)
+		default:
+			logf("tax-de: export.requested.ask for entry_key=%q, not ours (%q or %q) — declining", payload.EntryKey, dsfinvkExportEntryKey, datevExportEntryKey)
 			os.Exit(0)
 		}
-		fmt.Print(string(mustJSON(map[string]any{
-			"ok": true,
-			"message": fmt.Sprintf(
-				"DSFinV-K export triggered (fiskaly export id=%s). This is async and can take up to an hour per fiskaly's docs — "+
-					"polling for completion is not implemented here, check the fiskaly dashboard.", info),
-		})))
-		os.Exit(0)
 
 	default:
 		logf("tax-de: unhandled event type %q", ev.Type)
