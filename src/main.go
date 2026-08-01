@@ -93,6 +93,15 @@ const signDEBase = "https://kassensichv.io/api/v2"
 // NEEDS SANDBOX VERIFICATION: same caveat as signDEBase.
 const dsfinvkBase = "https://kassensichv.io/api/v1/dsfinvk"
 
+// dsfinvkExportEntryKey must match manifest.json's entries[].key for the
+// "export" entry. The host resolves export.requested.ask by plugin id, so
+// this plugin (declaring exactly one export entry) is already only ever
+// asked on its own behalf — this check is defense-in-depth for the day
+// this plugin ships a second export entry with a different key, not a fix
+// for cross-plugin routing (that's the host's job, see universal-till's
+// EventBus.AskPlugin).
+const dsfinvkExportEntryKey = "dsfinvk-export-de"
+
 const (
 	unsignedQueueKey = "unsigned_queue" // storage key: sales that failed to sign, pending retry
 	maxQueue         = 200              // bounded, oldest dropped past this (mirrors ut-plugin-integration-webhook)
@@ -685,10 +694,11 @@ func main() {
 		handleTaxRateAsk(raw)
 
 	// The generic export/report dispatch hook (ut-docs#189) — the host
-	// (internal/pages/data_api.go) publishes this for any installed
-	// export/report entry, keyed by entries[].key in the payload; this
-	// plugin only declares one export entry (dsfinvk-export-de) so it
-	// answers unconditionally rather than switching on entry_key.
+	// (internal/pages/data_api.go) resolves entries[].key to this plugin's
+	// id and asks this plugin specifically (EventBus.AskPlugin, not a
+	// broadcast Ask), so entry_key here is always already ours. Checked
+	// anyway (declining, not answering, on a mismatch) as defense-in-depth
+	// against a future second export entry in this same plugin.
 	case ev.Type == "export.requested.ask":
 		var payload struct {
 			From     string `json:"from"`
@@ -700,6 +710,10 @@ func main() {
 		}
 		_ = json.Unmarshal(raw, &wrapper)
 		_ = json.Unmarshal(wrapper.Payload, &payload)
+		if payload.EntryKey != "" && payload.EntryKey != dsfinvkExportEntryKey {
+			logf("tax-de: export.requested.ask for entry_key=%q, not ours (%q) — declining", payload.EntryKey, dsfinvkExportEntryKey)
+			os.Exit(0)
+		}
 		if payload.From == "" || payload.To == "" {
 			now := time.Now().UTC()
 			payload.To = now.Format("2006-01-02")
