@@ -35,8 +35,9 @@ needed, ADR-0002's `tax`/`export` types already exist):
   FINISHED`) with a receipt schema built from the sale's real line items
   (VAT-rate buckets from `tax_rate_bp`) and payments (cash vs. non-cash).
 - **`export` — DSFinV-K export.** Calls fiskaly's DSFinV-K API to trigger an
-  export for a date range. **Not wired to any till UI** — see "Known gaps"
-  below.
+  export for a date range. Reachable from a manager's Data/Export page in
+  the till since ut-docs#189 (`export.requested.ask` hook) — see "Known
+  gaps" below for what's still incomplete once triggered.
 - **Dine-in/takeaway VAT rate switching (§12 UStG).** Subscribes to
   `tax.rate.ask` — a generic, blocking, value-returning hook
   (`EventBus.Ask`) universal-till's core added specifically so this rule
@@ -73,16 +74,18 @@ needed, ADR-0002's `tax`/`export` types already exist):
    of this tension; that's a real decision for whoever takes this further,
    not something this skeleton commits to.
 
-2. **DSFinV-K export is not actually reachable from the till today.**
-   Confirmed against `ut-docs/reference/plugin-manifest.md` and
-   `universal-till/internal/plugins/types.go`: the plugin engine currently
-   dispatches `page`, `button`, and `theme` canonical types natively;
-   `report`/`export` types are registered and listed on the plugin info
-   card but have **no dispatcher yet**. `exportDSFinVK` in `src/main.go` is
-   real, callable code (triggered here by a placeholder event type,
-   `tax.de.dsfinvk.export.requested`, that nothing in the host currently
-   publishes) — not a stub, but also not something a merchant can click a
-   button to run yet.
+2. **DSFinV-K export is now reachable from the till (ut-docs#189), but only
+   as a trigger.** A manager's Data/Export page action publishes the
+   generic, blocking `export.requested.ask` event
+   (`universal-till/internal/pages/data_api.go`); this plugin declares that
+   event in `manifest.json`'s `hooks[]` and answers it in `main()`,
+   calling `exportDSFinVK` and reporting back whether the fiskaly trigger
+   call succeeded. Because `exportDSFinVK` only ever *starts* an async
+   fiskaly job (can take up to an hour per fiskaly's docs — see Known gap
+   #3), the response never has file bytes to hand back inline; the till
+   shows the trigger result as a status message, not a download. Polling
+   fiskaly for the finished export and surfacing a real download is not
+   implemented.
 
 3. **DSFinV-K export would be incomplete even once wired up.** A real
    DSFinV-K export depends on `cashPointClosing` records — periodic
@@ -181,9 +184,9 @@ about it needed a sandbox account.
    or whether a local/hardware TSE path is required, per ADR-0025's
    explicitly-unresolved open question.
 4. **Build the cash-point-closing aggregation** (Known gaps #3) so a
-   DSFinV-K export is actually complete, and wire canonical_type `export`
-   into an actual dispatcher/UI trigger in `universal-till` (Known gaps #2)
-   so a merchant can run one.
+   triggered DSFinV-K export is actually complete, and implement polling +
+   a real downloadable result once fiskaly's async export finishes (Known
+   gaps #2) — today's `export.requested.ask` response is trigger-only.
 5. **Test the TSE/DSFinV-K paths against the real wazero host runtime**,
    not just `go build` — the way `ut-plugin-payment-sumup` was verified
    before its reader-checkout path shipped, and the way `tax.rate.ask` now

@@ -1,7 +1,7 @@
 {
   "id": "com.universaltill.tax-de",
   "name": "Germany Fiscal Compliance (TSE + DSFinV-K)",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Starting-point integration against fiskaly's Cloud-TSE (SIGN DE) API for KassenSichV transaction signing and fiskaly's DSFinV-K export API for tax-audit exports. Starting skeleton: NOT tested against a real fiskaly account, NOT legally verified for DSFinV-K compliance, and NOT a substitute for tax-advisor sign-off before any merchant relies on it. See README before installing.",
   "author": "Universal Till",
   "website": "https://universaltill.com",
@@ -79,6 +79,10 @@
     {
       "event": "tax.rate.ask",
       "action": "tax.rate"
+    },
+    {
+      "event": "export.requested.ask",
+      "action": "export.dsfinvk"
     }
   ]
 }
