@@ -607,13 +607,12 @@ func recordResult(res tseSignResult) {
 
 // --- DSFinV-K export (fiskaly DSFinV-K API) ---
 //
-// NOT WIRED TO ANY TILL UI TODAY: universal-till's plugin engine only
-// dispatches `page`, `button`, and `theme` canonical types natively today
-// (confirmed against ut-docs reference/plugin-manifest.md and
-// internal/plugins/types.go — `report`/`export` are registered/listed on
-// the plugin info card but have no dispatcher yet). This code path is real
-// and callable (e.g. by a future export dispatcher, or manually against the
-// wasm module for testing) but nothing in the current till invokes it.
+// Reachable from the till since ut-docs#189: a manager's Data/Export page
+// action dispatches the generic, blocking `export.requested.ask` event
+// (universal-till internal/pages/data_api.go → internal/plugins EventBus);
+// this plugin declares that event in manifest.json's hooks[] and answers it
+// below in main(), the same "write JSON to stdout" convention
+// handleTaxRateAsk already uses for tax.rate.ask.
 //
 // ALSO NOT COMPLETE even on the fiskaly side: a real DSFinV-K export
 // requires cash_point_closing records (period aggregates of every signed
@@ -685,14 +684,16 @@ func main() {
 	case ev.Type == "tax.rate.ask":
 		handleTaxRateAsk(raw)
 
-	// Custom, NOT-YET-WIRED event: no dispatcher in universal-till calls
-	// canonical_type "export" plugins today (see exportDSFinVK's doc
-	// comment). Handled here so the export path is real, testable code
-	// rather than a stub, reachable once a host-side trigger exists.
-	case ev.Type == "tax.de.dsfinvk.export.requested":
+	// The generic export/report dispatch hook (ut-docs#189) — the host
+	// (internal/pages/data_api.go) publishes this for any installed
+	// export/report entry, keyed by entries[].key in the payload; this
+	// plugin only declares one export entry (dsfinvk-export-de) so it
+	// answers unconditionally rather than switching on entry_key.
+	case ev.Type == "export.requested.ask":
 		var payload struct {
-			From string `json:"from"`
-			To   string `json:"to"`
+			From     string `json:"from"`
+			To       string `json:"to"`
+			EntryKey string `json:"entry_key"`
 		}
 		var wrapper struct {
 			Payload json.RawMessage `json:"payload"`
@@ -706,6 +707,22 @@ func main() {
 		}
 		ok, info := exportDSFinVK(payload.From, payload.To)
 		logf("tax-de: dsfinvk export requested from=%s to=%s ok=%v info=%s", payload.From, payload.To, ok, info)
+		// This plugin only ever triggers fiskaly's async job (see
+		// exportDSFinVK's doc comment) — it never has file bytes to return
+		// inline, so the response always omits content_b64/filename.
+		if !ok {
+			fmt.Print(string(mustJSON(map[string]any{
+				"ok":    false,
+				"error": "DSFinV-K export trigger failed (not configured, or fiskaly auth/request error — see plugin logs)",
+			})))
+			os.Exit(0)
+		}
+		fmt.Print(string(mustJSON(map[string]any{
+			"ok": true,
+			"message": fmt.Sprintf(
+				"DSFinV-K export triggered (fiskaly export id=%s). This is async and can take up to an hour per fiskaly's docs — "+
+					"polling for completion is not implemented here, check the fiskaly dashboard.", info),
+		})))
 		os.Exit(0)
 
 	default:
