@@ -54,13 +54,31 @@ transaction first, which this plugin does not build (see README "Known
 gaps"). Don't remove the doc comments explaining this — they're load-bearing
 context for whoever wires the dispatcher up.
 
+## `export` canonical type now has TWO entries (ut-docs#41)
+
+`manifest.json`'s `entries[]` has a second `type: export` item,
+`datev-buchungsstapel-export-de`, alongside `dsfinvk-export-de`. Both answer
+`export.requested.ask`, dispatched in `src/main.go` by `payload.EntryKey` —
+if you add a third export entry, extend that switch, don't just check
+against one constant again. Unlike DSFinV-K, the DATEV path needs no
+fiskaly account: it's pure local data transformation (`src/datev`) of the
+`sales[]` the host now sends in the payload (ut-docs#221) into a DATEV EXTF
+CSV, returned inline via `content_b64` — see README's "DATEV Buchungsstapel
+export" bullet and its Known gaps #5/#6.
+
 ## Code layout
 
 - `src/main.go` — single WASI command, dispatches on the event JSON's
   `type` field (`sale.completed` → `handleSaleCompleted`; `tax.rate.ask` →
   `handleTaxRateAsk`, the dine-in/takeaway VAT switch, verified against a
-  real wazero run — see README's status table; the placeholder
-  export-request type → `exportDSFinVK`).
+  real wazero run — see README's status table; `export.requested.ask` →
+  `handleDSFinVKExport` or `handleDATEVExport` depending on `entry_key`).
+- `src/datev/` — DATEV EXTF Buchungsstapel file-building logic, deliberately
+  its OWN package with no `//go:build wasip1` tag (unlike `src/main.go`) so
+  `go test ./src/datev/...` runs on the host with no wasm build — the only
+  Go tests this repo has. Never hardcode a real chart-of-accounts number in
+  here; `Build` must keep refusing (not guessing) when a tax rate has no
+  configured Gegenkonto.
 - Host functions imported from module `ut` (see docs repo
   `reference/plugin-host-functions.md`): `log_write`, `settings_get`,
   `storage_get`, `storage_set`, `http_request`. Buffer ABI: data calls
@@ -84,10 +102,11 @@ context for whoever wires the dispatcher up.
 
 ## Before committing
 
+- `go test ./...` (now real — `src/datev` has no build tag; every other
+  package here is `main`/wasip1-only and stays untested by this command,
+  same as before).
 - `bash scripts/build.sh` (the real build check — cross-compiles
-  `GOOS=wasip1 GOARCH=wasm`; plain `go build ./...` matches no packages by
-  design, same as every sibling plugin, because `src/main.go` is gated
-  `//go:build wasip1`).
+  `GOOS=wasip1 GOARCH=wasm`).
 - `bash scripts/validate.sh` (manifest shape: `canonical_type: tax`,
   `countries: ["DE"]`, one `tax`-type and one `export`-type entry).
 - Keep README.md's status table and this file's caveats current — this repo

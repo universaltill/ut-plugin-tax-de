@@ -1,4 +1,4 @@
-# Germany Fiscal Compliance (TSE + DSFinV-K) — Universal Till plugin
+# Germany Fiscal Compliance (TSE + DSFinV-K + DATEV) — Universal Till plugin
 
 A WASM (`GOOS=wasip1 GOARCH=wasm`) plugin implementing Germany's KassenSichV
 fiscal requirements via **fiskaly**'s Cloud-TSE ("SIGN DE") API for
@@ -8,6 +8,10 @@ exports. Built per [`ut-docs` ADR-0025](https://github.com/universaltill/ut-docs
 the first integration target because SumUp itself delegates TSE signing to
 fiskaly rather than building it in-house — real-world precedent that this is
 the standard integration shape for German fiscal compliance.
+
+Also builds a **DATEV EXTF Buchungsstapel export** (ut-docs#41) — a
+locally-generated accounting-batch file for handing sales to an accountant,
+unrelated to fiskaly/KassenSichV (see its own section below).
 
 ## Status: starting skeleton, not a certified compliance solution
 
@@ -23,6 +27,9 @@ vs. "researched, not tested":
 | KassenSichV compliance overall | **Not certified.** This is a starting skeleton. A merchant must get real legal/tax-advisor sign-off before relying on this for a live business — this plugin existing does not make a till KassenSichV-compliant. |
 | `go build ./...` / `scripts/build.sh` | **Confirmed** — builds clean as of this commit (see CI). |
 | End-to-end behavior against the till's real event bus | **Partially verified.** The `sale.completed`/TSE-signing path has NOT been exercised against `universal-till`'s actual `WasmRuntime.HandleEvent`. The `tax.rate.ask` handler HAS been run against the compiled `bin/plugin.wasm` through a real wazero runtime (same engine `universal-till` uses) with a minimal host-function stub — verified event dispatch, a settings lookup, and the exact stdout JSON shape core expects, for all three cases (dine-in declines, takeaway with a configured override answers, takeaway with no override declines). That stub is NOT `universal-till`'s actual host function implementations or a real installed-plugin flow through the till's UI — closer than untested, not the same as verified live. |
+| DATEV EXTF file structure (31-field header row 1, 125-column header row 2, semicolon-delimited, Windows-1252, CRLF) | **Confirmed against a real reference file** (github.com/ledermann/datev's `EXTF_Buchungsstapel.csv`, byte-verified 2026-08-01), not reconstructed from memory — see `src/datev/datev.go`'s package doc comment. An independent review caught an early draft undercounting header row 1's trailing fields (27 vs. the real 31); fixed and pinned by `TestHeader1_FieldCount`. Unit-tested (`go test ./src/datev/...`), including a Windows-1252 round-trip check on the umlaut/en-dash header text. |
+| DATEV format-version numbers (`700`/`21`/`13`) and Soll/Haben booking convention (Kasse debited, Erlöskonto credited via an Automatikkonto, no BU-Schlüssel by default) | **Researched, not confirmed against DATEV's current published spec** (developer.datev.de 403'd when fetched) or a real accountant/DATEV import. Matches the reference file and common SKR03/04 practice, but NEEDS ACCOUNTANT VERIFICATION before a real filing. |
+| DATEV chart-of-accounts mapping (which Konto/Gegenkonto number per tax rate) | **Never guessed.** No default real account numbers anywhere in this plugin — `datev_konto_kasse`/`datev_erloeskonten` are merchant/accountant-configured settings; the export refuses (with a clear error) rather than emit an unconfigured or invented account number. |
 
 ## What this plugin does
 
@@ -38,6 +45,12 @@ needed, ADR-0002's `tax`/`export` types already exist):
   export for a date range. Reachable from a manager's Data/Export page in
   the till since ut-docs#189 (`export.requested.ask` hook) — see "Known
   gaps" below for what's still incomplete once triggered.
+- **`export` — DATEV Buchungsstapel export.** A second `export`-type entry
+  (`datev-buchungsstapel-export-de`), also reachable from the Data/Export
+  page. Unlike DSFinV-K, this needs no fiskaly account: it's a pure local
+  transformation of the sales the till already sends in the
+  `export.requested.ask` payload (ut-docs#221) into a DATEV EXTF CSV file,
+  returned inline (`content_b64`) for immediate download — see `src/datev/`.
 - **Dine-in/takeaway VAT rate switching (§12 UStG).** Subscribes to
   `tax.rate.ask` — a generic, blocking, value-returning hook
   (`EventBus.Ask`) universal-till's core added specifically so this rule
@@ -105,6 +118,30 @@ needed, ADR-0002's `tax`/`export` types already exist):
    granularity, but not exhaustively tested against every payment method
    string the till can produce.
 
+5. **DATEV export posts every sale to one configured Kasse/Bank account,
+   regardless of payment method.** A real shop's accountant may want
+   separate intermediary accounts per payment method (e.g. `1000` Kasse vs.
+   a card-clearing account) — the export's payload already carries
+   per-payment-method breakdowns (`ExportSaleRow.Payments`) but `src/datev`
+   does not use them yet, posting the sale's whole gross total against
+   `datev_konto_kasse` instead. A real follow-up, not built here.
+
+6. **DATEV format-version numbers and the Soll/Haben booking convention are
+   not confirmed against DATEV's current published spec or a live
+   accountant/import test** — see the status table above. Don't treat a
+   structurally valid file as an automatically correct one.
+
+7. **A sale-level discount can make DATEV export refuse a sale outright.**
+   `internal/data.ExportSaleRow.TaxLines` is built from `sale_lines`
+   independently of `sales.total` (universal-till's `SalesForExport`), and a
+   sale-level discount isn't currently pushed down into `sale_lines` — so a
+   discounted sale's tax-line sum can legitimately disagree with its total.
+   Rather than book a Kasse debit that doesn't match what the till actually
+   took, `datev.Build` refuses the whole export and names the mismatched
+   sale(s). Until discounts are reflected per-line upstream, any period with
+   a discounted sale in it can't be DATEV-exported at all — a real
+   limitation, not just a defensive check that never fires.
+
 ## What's real vs. placeholder
 
 **Real (actual HTTP calls to fiskaly's documented API shape, not stubs):**
@@ -170,6 +207,25 @@ about it needed a sandbox account.
   `{"tax-drink-de": 700}` for a drinks tax code that should be 7% on
   takeaway. Edited as raw JSON — there is no dedicated form for this yet
   (see "What a human still needs to do" below).
+- `datev_berater_nr` / `datev_mandant_nr` — the DATEV Beraternummer/
+  Mandantennummer for the merchant's accountant (from the accountant, not
+  guessable). Required — export refuses without them.
+- `datev_sachkontenlaenge` — G/L account number length, digits (default
+  `"4"`, the SKR03/04-standard length).
+- `datev_wj_beginn` — fiscal year start, `MMDD` (default `"0101"`,
+  calendar-year; override for a non-calendar fiscal year).
+- `datev_konto_kasse` — the Konto debited for every booking row (the
+  till's cash/bank collector account). Required — no default, export
+  refuses without it.
+- `datev_erloeskonten` — JSON object, tax rate in basis points → Gegenkonto
+  (revenue account), e.g. `{"1900": "8400", "700": "8300"}`. Required to
+  cover every tax rate that appears in the exported period — export refuses
+  and names the missing rate(s) rather than guessing an account number.
+- `datev_bu_schluessel` — optional JSON object, tax rate in basis points →
+  BU-Schlüssel override, only needed if `datev_erloeskonten`'s accounts are
+  NOT already "Automatikkonten" (accounts DATEV auto-splits VAT for) — most
+  SKR03/04 standard revenue accounts (e.g. `8400`/`8300`) already are, so
+  this is usually left empty.
 
 ## What a human still needs to do before this could ever go live
 
@@ -195,6 +251,22 @@ about it needed a sandbox account.
    JSON text field, no form to pick a tax code from the shop's actual
    catalog and set its takeaway rate. A real merchant can't use this
    feature without either that UI or editing plugin settings by hand.
+7. **Get the DATEV export's chart-of-accounts mapping confirmed by the
+   merchant's actual accountant** before relying on it for a real filing —
+   `datev_konto_kasse`/`datev_erloeskonten` are configuration this plugin
+   never guesses, but a wrong number entered by whoever configures it would
+   still mis-book real accounting records; a real accountant should
+   confirm the values, not just that the fields are filled in.
+8. **Confirm the DATEV format-version numbers and Soll/Haben booking
+   convention** (`src/datev/datev.go`'s package doc comment) against
+   DATEV's current published "Formatbeschreibung: Buchungsstapel" and a
+   real DATEV import test — this plugin's file is structurally grounded in
+   a real reference export, not verified end-to-end.
+9. **Decide whether DATEV export should split Konto by payment method**
+   (Known gap #5) instead of posting every sale to one Kasse/Bank account.
+10. **Push sale-level discounts down into `sale_lines`** (Known gap #7) so a
+    discounted sale's tax-line sum reconciles with its total — until then,
+    any period containing a discounted sale can't be DATEV-exported at all.
 
 ## Build
 
