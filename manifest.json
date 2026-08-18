@@ -1,8 +1,8 @@
 {
   "id": "com.universaltill.tax-de",
   "name": "Germany Fiscal Compliance (TSE + DSFinV-K)",
-  "version": "0.3.1",
-  "description": "Starting-point integration against fiskaly's Cloud-TSE (SIGN DE) API for KassenSichV transaction signing, fiskaly's DSFinV-K export API for tax-audit exports, and a DATEV EXTF Buchungsstapel export for handing sales to an accountant. Starting skeleton: NOT tested against a real fiskaly account, NOT legally verified for DSFinV-K compliance, chart-of-accounts mapping for the DATEV export is merchant/accountant-configured (no defaults assumed), and none of this is a substitute for tax-advisor sign-off before any merchant relies on it. See README before installing.",
+  "version": "0.3.2",
+  "description": "Starting-point integration against fiskaly's Cloud-TSE (SIGN DE) API for KassenSichV transaction signing, fiskaly's DSFinV-K export API for tax-audit exports, and a DATEV EXTF Buchungsstapel export for handing sales to an accountant. SIGN DE's fiskaly API contract (host, auth, TSS/transaction lifecycle, receipt schema) was verified 2026-08-18 against a real fiskaly sandbox; DSFinV-K export and legal DSFinV-K compliance are NOT verified, chart-of-accounts mapping for the DATEV export is merchant/accountant-configured (no defaults assumed), and none of this is a substitute for tax-advisor sign-off before any merchant relies on it. See README before installing.",
   "author": "Universal Till",
   "website": "https://universaltill.com",
   "canonical_type": "tax",
@@ -13,7 +13,7 @@
   "permissions": [
     "events:receive",
     "sales:read",
-    "net:kassensichv.io",
+    "net:kassensichv-middleware.fiskaly.com",
     "storage"
   ],
   "locales": [
