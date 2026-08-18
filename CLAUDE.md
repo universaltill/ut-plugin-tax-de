@@ -11,12 +11,43 @@ and fiscal compliance") and its "Real-world precedent" section: SumUp itself
 delegates TSE signing to fiskaly rather than building it in-house, so this
 plugin follows the same shape rather than inventing one.
 
-## Status: skeleton, not verified against a live fiskaly account
+## Status: SIGN DE's API contract confirmed 2026-08-18; DSFinV-K still a skeleton
 
-No fiskaly credentials were available while building this — every endpoint
-in `src/main.go` is grounded in fiskaly's **public** documentation
-(developer.fiskaly.com, kassensichv.net, kassensichv.io) but flagged
-`NEEDS SANDBOX VERIFICATION` in its doc comment. README.md has the full
+SIGN DE (TSE signing) was verified 2026-08-18 against a real fiskaly TEST
+sandbox — see `src/main.go`'s package doc comment and README.md's status
+table for exactly what that proved and what it didn't. Two real bugs were
+found and fixed by that test: `signDEBase` pointed at a dead host
+(`kassensichv.io`, now 404s everywhere — corrected to
+`kassensichv-middleware.fiskaly.com/api/v2`), and `parseSignResponse` read
+the signature from a response shape (`tss_tx_result.signature.value`) that
+doesn't match fiskaly's real payload (`signature.value`, top-level) — that
+second bug alone would have made every real sign attempt silently fail even
+once the host was fixed.
+
+**This does not make the plugin the till's real TSE signer.**
+`universal-till` core's actual TSE-signing extension point is a different,
+newer hook, `fiscal.sign.ask` (ADR-0041/044/048, blocking, exclusive
+between signer plugins, persists evidence, renders it on the receipt, gates
+the ADR-0048 system-of-record check — see
+`ut-docs/reference/contracts/fiscal-sign-ask.md`,
+`universal-till/internal/pages/fiscal_sign_hook.go`). This plugin only
+declares `sale.completed` in `manifest.json`'s `hooks[]` and does not
+subscribe to `fiscal.sign.ask` at all — so core currently sees **zero
+fiscal signers installed**, regardless of this fix. This plugin's own
+fiskaly connection now genuinely works (real auth, real signature), but
+it's entirely disconnected from the till's real receipts/compliance gate.
+Wiring this plugin to `fiscal.sign.ask` is real, separate, higher-priority
+follow-up work — not done here, and code review (2026-08-18) confirmed the
+2026-08-18 fix makes it more urgent, not less, since the fiskaly side is now
+demonstrably functional.
+
+DSFinV-K export is unchanged and still fully unverified — every endpoint
+in `src/main.go` for it is grounded in fiskaly's **public** documentation
+(developer.fiskaly.com, kassensichv.net) but flagged
+`NEEDS SANDBOX VERIFICATION` in its doc comment. It still points at the now-
+confirmed-dead `kassensichv.io`, and per `fiskalyparse.DsfinvkBase`'s doc
+comment may need a genuinely different host from SIGN DE's — do not assume the
+2026-08-18 fix carries over. README.md has the full
 honest-status table ("researched, not tested" vs. "confirmed") — read it
 before touching this code, and keep both README.md and this file in sync
 with reality as verification happens (don't let a `NEEDS SANDBOX
@@ -85,12 +116,17 @@ export" bullet and its Known gaps #5/#6.
   return the FULL length, retry with a bigger buffer if it exceeds cap;
   negatives are host errors (-1 not found, -2 denied, -3 internal,
   -4 invalid) — same convention as every sibling plugin.
-- `net:kassensichv.io` permission gates the `http_request` host function
-  (see `universal-till/internal/plugins/wasm_hostfns.go`'s
-  `hostHTTPRequest`) — this is the first-party host function ADR-0025
-  flagged as an open follow-up ("whether TSE signing needs a first-party
-  host function... a real question for whoever builds ut-plugin-tax-de");
-  it already existed by the time this repo was built (the SumUp plugin uses
+- `net:kassensichv-middleware.fiskaly.com` permission gates the
+  `http_request` host function (see
+  `universal-till/internal/plugins/wasm_hostfns.go`'s `hostHTTPRequest`) —
+  changed 2026-08-18 from `net:kassensichv.io`, which is confirmed dead (see
+  Status above); it covers SIGN DE only, NOT DSFinV-K (still on the dead
+  host, still unverified — whoever confirms its real host must add its own
+  permission here, not assume this one covers it). This is the first-party
+  host function ADR-0025 flagged as an open follow-up ("whether TSE signing
+  needs a first-party host function... a real question for whoever builds
+  ut-plugin-tax-de"); it already existed by the time this repo was built
+  (the SumUp plugin uses
   the same mechanism with `net:api.sumup.com`), so no new host-side work was
   needed.
 - `countries: ["DE"]` in `manifest.json` — the new `PluginListing` field

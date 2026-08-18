@@ -21,8 +21,9 @@ vs. "researched, not tested":
 
 | Claim | Status |
 |---|---|
-| Endpoint paths/request shapes match fiskaly's real, public API | **Researched, not tested.** Grounded in fiskaly's public docs (developer.fiskaly.com, kassensichv.net, kassensichv.io) as of 2026-07-28 — not invented from nothing. Every endpoint is flagged `NEEDS SANDBOX VERIFICATION` in code comments. |
-| Tested against a real fiskaly sandbox/production account | **Not done.** No fiskaly credentials were available at write time. Nothing below has been run against a live TSS. |
+| SIGN DE (TSE signing): host, auth, TSS/client/transaction lifecycle, `standard_v1` receipt schema | **Confirmed 2026-08-18** against a real fiskaly TEST-environment sandbox: auth → create TSS → initialize → create/register a client → start+finish a transaction (19% VAT, card) → retrieved with a valid ECDSA signature. Fixed two real bugs this uncovered: `signDEBase` was pointed at `kassensichv.io`, now confirmed **dead** (plain 404 on every path, not fiskaly's server anymore) — corrected to `kassensichv-middleware.fiskaly.com/api/v2`; `parseSignResponse` was reading the signature from a `tss_tx_result` wrapper that doesn't exist in the real response (it's top-level `signature.value`) — would have silently discarded every real signature even with a working host. See `src/main.go` doc comments for exactly what was and wasn't exercised (e.g. only the `NORMAL` VAT bucket, not `REDUCED_1`/`NULL`/`SPECIAL_RATE_1`; this test's own curl script used a 3-call start/update/finish sequence, while this plugin's code uses a 2-call start/finish sequence — architecturally consistent with fiskaly's revision model but not independently re-verified). |
+| DSFinV-K export: endpoint paths/request shapes | **Researched, not tested — unchanged by the 2026-08-18 fix.** Still points at `kassensichv.io` (now confirmed dead), and may need a genuinely different host from SIGN DE's, not just a different path — see `dsfinvkBase`'s doc comment in `src/main.go`. Every endpoint here remains flagged `NEEDS SANDBOX VERIFICATION`. |
+| Tested against a real fiskaly sandbox/production account | **Partially done, 2026-08-18.** SIGN DE's raw API contract was exercised directly (see row above) — the *compiled plugin* has not yet been run end-to-end through `universal-till`'s real event bus/wazero runtime (see the end-to-end row below), and DSFinV-K has not been touched at all. |
 | DSFinV-K export format/content is legally compliant | **Not verified, at all.** No DSFinV-K output from this plugin has been checked against the DSFinV-K spec or a real tax audit. |
 | KassenSichV compliance overall | **Not certified.** This is a starting skeleton. A merchant must get real legal/tax-advisor sign-off before relying on this for a live business — this plugin existing does not make a till KassenSichV-compliant. |
 | `go build ./...` / `scripts/build.sh` | **Confirmed** — builds clean as of this commit (see CI). |
@@ -156,31 +157,75 @@ needed, ADR-0002's `tax`/`export` types already exist):
 - Failure handling — never returns a fabricated signature; logs loudly and
   queues for retry (see `unsigned_queue` in plugin storage).
 
-**Placeholder / unconfirmed:**
-- The exact fiskaly API host/version (`signDEBase`, `dsfinvkBase` constants
-  in `src/main.go`) — fiskaly has had multiple entry points over time
-  (`kassensichv.io` legacy, `kassensichv.fiskaly.com` v2,
-  `workspace.fiskaly.com` newer portal). Confirm the current one against
-  the merchant's actual fiskaly dashboard before going live.
+**Confirmed 2026-08-18 (SIGN DE only — see the status table above for exactly
+what this does and doesn't prove):**
+- `signDEBase` (now `src/fiskalyparse.SignDEBase`) — `kassensichv.io`
+  (previously assumed current) is confirmed **dead**; the real host is
+  `https://kassensichv-middleware.fiskaly.com/api/v2`, verified against a
+  live sandbox and cross-checked against fiskaly's own docs
+  (workspace.fiskaly.com/api/sign-de/).
 - The `standard_v1` schema field names (`amounts_per_vat_rate`,
-  `amounts_per_payment_type`, the `vat_rate`/`payment_type` enum values) —
-  reconstructed from fiskaly's public docs/support articles, not confirmed
-  against a live sandbox response.
+  `amounts_per_payment_type`) and the `NORMAL`/`NON_CASH` enum values —
+  accepted and echoed back correctly by a live sandbox. `REDUCED_1`/`NULL`/
+  `SPECIAL_RATE_1` were not individually exercised.
+- The `FINISHED`-transaction response envelope
+  (`src/fiskalyparse.ParseSignResponse`) — the signature and log timestamp
+  are **top-level** fields (`signature.value`, `log.timestamp`), NOT nested
+  under a `tss_tx_result` wrapper as an earlier draft of this code
+  (incorrectly) assumed; that wrapper does not exist in fiskaly's real
+  response and would have silently discarded every real signature even once
+  the host was fixed. See `src/fiskalyparse/parse_test.go` — table-tested
+  against the real captured response, plus a regression test pinning that
+  the old wrapper shape must never parse again.
+
+**Still placeholder / unconfirmed:**
+- `dsfinvkBase` (`src/fiskalyparse.DsfinvkBase`) — still points at the
+  now-confirmed-dead `kassensichv.io`, deliberately NOT changed by the
+  2026-08-18 fix. fiskaly's own SIGN DE reference page documents no separate
+  DSFinV-K host, which hints the real one may not be a distinct `dsfinvk.*`
+  domain at all (possibly the same middleware host, a different path) — not
+  verified either way, don't guess.
 - `tx_id` generation (`txID` in `src/main.go`) — fiskaly's docs examples
   all use UUIDs; this derives a deterministic pseudo-UUID from the sale id
   since the till's `sale_id` isn't guaranteed to already be one. Whether
   fiskaly strictly requires a v4 UUID or accepts any unique string is
-  unconfirmed.
-- The `FINISHED`-transaction response envelope (`parseSignResponse`) —
-  best-effort field names (`tss_tx_result.signature.value`,
-  `tss_tx_result.log_time`), not confirmed.
+  unconfirmed. **Known related gap, not yet fixed**: because `txID` is
+  deterministic, the unsigned-retry queue re-submitting the *same* sale
+  re-issues `tx_revision=1` against a transaction id fiskaly may have
+  already partially consumed on the first attempt (e.g. if `start`
+  succeeded but `finish` failed) — that retry can conflict forever instead
+  of draining. Not introduced by the 2026-08-18 fix (no call reached
+  fiskaly at all before it), but now a live, reachable risk instead of a
+  theoretical one. Tracked as a follow-up card.
 - The DSFinV-K `/export` trigger request/response shape — reconstructed
   from fiskaly support docs ("ByBusinessDate"/"ByCreationDate" selection,
   TAR/ZIP format), not confirmed.
 
-Every one of the above is also flagged `NEEDS SANDBOX VERIFICATION` at its
-definition in `src/main.go` — the code comments are the source of truth if
-this README drifts.
+Every unconfirmed item above is also flagged `NEEDS SANDBOX VERIFICATION` at
+its definition (`src/main.go` or `src/fiskalyparse/parse.go`) — the code
+comments are the source of truth if this README drifts.
+
+**Upgrade note (0.3.1 → 0.3.2 or any version that changes `permissions`):**
+an already-installed plugin's permission ROWS are inserted once and never
+reconciled on upgrade (unlike settings) — a new `net:<host>` permission
+added in a later version lands **ungranted** until a manager re-grants it
+in the till's plugin UI, even though the manifest now declares it. Every
+fiskaly call will fail with a permission denial until that happens. Low
+impact today (no real installs of this plugin exist yet), but real for
+whoever installs 0.3.2 over an existing 0.3.x.
+
+**Not the till's real TSE signer yet.** This plugin's `sale.completed` hook
+now genuinely reaches fiskaly and gets a real signature — but
+`universal-till` core's actual TSE-signing integration point is a
+different, newer hook, `fiscal.sign.ask` (blocking, exclusive between
+signer plugins, persists evidence, renders it on the receipt, gates
+ADR-0048's system-of-record check — see
+`ut-docs/reference/contracts/fiscal-sign-ask.md`). This plugin does not
+subscribe to it. Concretely: core currently sees **zero fiscal signers
+installed** regardless of this fix — the till's receipts and compliance
+gate are entirely unaware this plugin's fiskaly connection works. Wiring
+`ut-plugin-tax-de` to `fiscal.sign.ask` is real, separate, higher-priority
+follow-up work, not done here.
 
 **`handleTaxRateAsk` (dine-in/takeaway VAT switching) is real, and is the
 one piece of this plugin actually verified against a real wazero-compiled

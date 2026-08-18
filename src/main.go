@@ -7,13 +7,33 @@
 // canonical types.
 //
 // STATUS — read before relying on this for anything real:
-//   - The endpoint paths/request shapes below follow fiskaly's PUBLICLY
-//     DOCUMENTED API (developer.fiskaly.com, kassensichv.net,
-//     kassensichv.io) as researched 2026-07-28. They have NOT been run
-//     against a real fiskaly sandbox/production account — no credentials
-//     were available at write time. Every endpoint below is flagged
-//     "NEEDS SANDBOX VERIFICATION" in its doc comment, same convention as
-//     ut-plugin-payment-sumup's unverified reader-checkout path.
+//   - SIGN DE (TSE signing): the fiskaly API contract this plugin implements
+//     — host, auth, TSS/client lifecycle, the ACTIVE/FINISHED transaction
+//     flow, and the standard_v1 receipt schema shape — was CONFIRMED live
+//     2026-08-18 against a real fiskaly sandbox account (auth → create TSS
+//     → initialize → create/register client → start+finish a transaction →
+//     retrieve it with a valid ECDSA signature). That test exercised the raw
+//     HTTP contract directly, not this compiled plugin end-to-end through
+//     universal-till's actual wazero runtime/host functions — see the
+//     README status table for the precise line between the two. Endpoints
+//     not exercised by that test (DSFinV-K export, REDUCED_1/NULL/
+//     SPECIAL_RATE_1 vat buckets, the RECEIPT_0104 return-receipt type, the
+//     deterministic-pseudo-UUID tx_id scheme) remain flagged "NEEDS SANDBOX
+//     VERIFICATION" below, same convention as ut-plugin-payment-sumup's
+//     unverified reader-checkout path.
+//   - DSFinV-K export: still entirely unconfirmed — public docs describe it
+//     as possibly a genuinely separate API/host from SIGN DE (cash_register/
+//     cashPointClosing concepts), not just a different path on the same
+//     host. Do not assume fiskalyparse.DsfinvkBase is even structurally right.
+//   - NOT the till's real TSE signer: universal-till core's actual
+//     TSE-signing extension point is a different, newer hook, fiscal.sign.ask
+//     (blocking, exclusive between signer plugins, persists evidence, gates
+//     ADR-0048 — see ut-docs/reference/contracts/fiscal-sign-ask.md). This
+//     plugin only declares sale.completed and does NOT subscribe to
+//     fiscal.sign.ask, so core currently sees ZERO fiscal signers installed
+//     regardless of the 2026-08-18 SIGN DE fix below — this plugin's fiskaly
+//     connection now genuinely works, but it's disconnected from the till's
+//     receipts and compliance gate. Real, separate follow-up work.
 //   - DSFinV-K export format/content compliance has NOT been legally
 //     verified against KassenSichV. Cash-point-closing generation (the
 //     aggregation step DSFinV-K exports actually depend on) is NOT
@@ -54,6 +74,7 @@ import (
 	"unsafe"
 
 	"github.com/universaltill/ut-plugin-tax-de/src/datev"
+	"github.com/universaltill/ut-plugin-tax-de/src/fiskalyparse"
 )
 
 // --- host functions (module "ut", see ut-docs reference/plugin-host-functions.md) ---
@@ -77,23 +98,12 @@ func storageGet(kPtr, kLen, dstPtr, dstCap uint32) int32
 //go:wasmimport ut storage_set
 func storageSet(kPtr, kLen, vPtr, vLen uint32) int32
 
-// signDEBase is fiskaly's Cloud-TSE ("SIGN DE") API, the KassenSichV
-// TSE-signing product. Publicly documented at developer.fiskaly.com /
-// kassensichv.net; historically hosted at kassensichv.io/api/v1, with a v2
-// also referenced in fiskaly's docs (kassensichv.fiskaly.com/api/v2).
-//
-// NEEDS SANDBOX VERIFICATION: confirm the exact current production host +
-// API version against the merchant's fiskaly dashboard/workspace before
-// going live — fiskaly has had multiple entry points (kassensichv.io
-// legacy, kassensichv.fiskaly.com v2, workspace.fiskaly.com newer portal)
-// and this was not confirmed against a live account.
-const signDEBase = "https://kassensichv.io/api/v2"
-
-// dsfinvkBase is fiskaly's DSFinV-K export API. Documented at
-// developer.fiskaly.com/dsfinvk — same host family as SIGN DE.
-//
-// NEEDS SANDBOX VERIFICATION: same caveat as signDEBase.
-const dsfinvkBase = "https://kassensichv.io/api/v1/dsfinvk"
+// signDEBase and dsfinvkBase moved to src/fiskalyparse (2026-08-18 code
+// review) so their values and ParseSignResponse are host-testable —
+// src/main.go is wasip1-only, excluded from ordinary `go test ./...`. See
+// fiskalyparse.SignDEBase / fiskalyparse.DsfinvkBase for the full status
+// (which is CONFIRMED, which is still NEEDS SANDBOX VERIFICATION, and why)
+// and parse_test.go for the regression coverage.
 
 // dsfinvkExportEntryKey must match manifest.json's entries[].key for the
 // "export" entry. The host resolves export.requested.ask by plugin id, so
@@ -184,8 +194,9 @@ func storagePut(key string, v []byte) {
 }
 
 // httpCall performs one outbound HTTP call through the host's http_request
-// function (permission-gated by `net:kassensichv.io` in manifest.json — see
-// universal-till/internal/plugins/wasm_hostfns.go hostHTTPRequest). ok is
+// function (permission-gated by `net:kassensichv-middleware.fiskaly.com` in
+// manifest.json — see universal-till/internal/plugins/wasm_hostfns.go
+// hostHTTPRequest). ok is
 // false only on a host/transport failure; a non-2xx HTTP status still
 // returns ok=true with status/body set.
 func httpCall(method, url string, headers map[string]string, jsonBody []byte) (body []byte, status int, ok bool) {
@@ -224,9 +235,14 @@ type cachedToken struct {
 // api_key/api_secret every time the cache is empty or a call 401s, rather
 // than implementing the refresh_token rotation flow fiskaly's SDKs use —
 // simpler and correct, just does one extra auth round-trip more often than
-// necessary. NEEDS SANDBOX VERIFICATION: token TTL, and whether /auth is
-// the exact current path (fiskaly's SDKs abstract this; verified only
-// against public docs, not a live account).
+// necessary. /auth as the path (relative to fiskalyparse.SignDEBase) is CONFIRMED
+// 2026-08-18 against a live sandbox — decoding the returned JWT showed a
+// 24h expiry (iat/exp claims), well past this function's conservative
+// 5-minute reuse window, so no change needed there. NEEDS SANDBOX
+// VERIFICATION still: behavior when a cached token is presented past its
+// real expiry (does a call 401, and does this function's caller retry
+// correctly? — not exercised by the 2026-08-18 test, which always
+// authenticated fresh).
 func fiskalyAuth(apiKey, apiSecret string) (string, bool) {
 	if raw, ok := storageRead(tokenStorageKey); ok {
 		var t cachedToken
@@ -240,7 +256,7 @@ func fiskalyAuth(apiKey, apiSecret string) (string, bool) {
 		"api_key":    apiKey,
 		"api_secret": apiSecret,
 	})
-	body, status, ok := httpCall("POST", signDEBase+"/auth", map[string]string{"Content-Type": "application/json"}, reqBody)
+	body, status, ok := httpCall("POST", fiskalyparse.SignDEBase+"/auth", map[string]string{"Content-Type": "application/json"}, reqBody)
 	if !ok || status < 200 || status >= 300 {
 		logf("tax-de: fiskaly auth failed (status=%d ok=%v)", status, ok)
 		return "", false
@@ -301,10 +317,13 @@ type saleCompletedEvent struct {
 // guessing further — fiskaly's enum also has REDUCED_2/NULL/SPECIAL_RATE_2-5
 // for cases (e.g. 0%) this skeleton doesn't attempt to classify.
 //
-// NEEDS SANDBOX VERIFICATION: the standard_v1 schema shape (amounts_per_
-// vat_rate / amounts_per_payment_type field names and this enum) is
-// reconstructed from fiskaly's public documentation and support articles,
-// not confirmed against a live sandbox response.
+// CONFIRMED 2026-08-18: the standard_v1 schema shape (amounts_per_vat_rate /
+// amounts_per_payment_type field names, sent with vat_rate="NORMAL" and
+// payment_type="NON_CASH") was accepted by a live fiskaly sandbox and echoed
+// back correctly in the signed transaction. NEEDS SANDBOX VERIFICATION
+// still: the REDUCED_1/NULL/SPECIAL_RATE_1 enum values below were not
+// exercised (only NORMAL was) — no reason to expect they're wrong, just not
+// independently proven the way NORMAL now is.
 func vatRateBucket(bp int) string {
 	switch bp {
 	case 1900:
@@ -375,11 +394,20 @@ type tseSignResult struct {
 // fabricated signature — on any auth, network, or non-2xx failure. See the
 // package doc comment for why a failure here cannot block the sale.
 //
-// NEEDS SANDBOX VERIFICATION: the ACTIVE/FINISHED two-call lifecycle with
-// an incrementing tx_revision query param is documented by fiskaly support
-// articles; the exact response envelope for a FINISHED transaction
-// (signature/log_time/signature_counter field names) was not confirmed
-// against a live account — parseSignResponse below is best-effort.
+// CONFIRMED 2026-08-18: the tx_revision-incrementing PUT lifecycle against a
+// live sandbox produces a real signed transaction, and parseSignResponse's
+// field paths now match the real FINISHED response envelope (see its doc
+// comment — the original guess was wrong). One nuance NOT independently
+// re-tested: the live verification used three PUT calls (start ACTIVE →
+// update ACTIVE-with-schema → finish FINISHED-with-schema, tx_revision
+// 1/2/3), matching fiskaly's own example collection; this function instead
+// goes directly from start (tx_revision=1, ACTIVE, no schema) to finish
+// (tx_revision=2, FINISHED, with schema) in two calls. Skipping the
+// intermediate update revision is consistent with fiskaly's documented
+// revision model (each PUT is just the next revision; nothing requires a
+// specific count of them before FINISHED) but was not itself run against
+// live fiskaly — worth confirming if a real sign attempt ever fails at the
+// finish step specifically.
 func signTransaction(sale saleCompletedEvent, apiKey, apiSecret, tssID, clientID string) tseSignResult {
 	result := tseSignResult{SaleID: sale.SaleID, AttemptedAt: time.Now().UTC()}
 
@@ -395,7 +423,7 @@ func signTransaction(sale saleCompletedEvent, apiKey, apiSecret, tssID, clientID
 
 	id := txID(sale.SaleID)
 	result.TxID = id
-	base := fmt.Sprintf("%s/tss/%s/tx/%s", signDEBase, tssID, id)
+	base := fmt.Sprintf("%s/tss/%s/tx/%s", fiskalyparse.SignDEBase, tssID, id)
 
 	// 1. Start the transaction.
 	startBody, _ := json.Marshal(map[string]any{
@@ -449,7 +477,7 @@ func signTransaction(sale saleCompletedEvent, apiKey, apiSecret, tssID, clientID
 		return result
 	}
 
-	sig, logTime := parseSignResponse(body)
+	sig, logTime := fiskalyparse.ParseSignResponse(body)
 	if sig == "" {
 		result.FailureReason = "finish_response_missing_signature"
 		return result
@@ -460,22 +488,9 @@ func signTransaction(sale saleCompletedEvent, apiKey, apiSecret, tssID, clientID
 	return result
 }
 
-// parseSignResponse pulls the signature out of a FINISHED transaction
-// response. NEEDS SANDBOX VERIFICATION — see signTransaction's doc comment.
-func parseSignResponse(body []byte) (signature, logTime string) {
-	var resp struct {
-		TSSTXResult struct {
-			Signature struct {
-				Value string `json:"value"`
-			} `json:"signature"`
-			LogTime string `json:"log_time"`
-		} `json:"tss_tx_result"`
-	}
-	if err := json.Unmarshal(body, &resp); err != nil {
-		return "", ""
-	}
-	return resp.TSSTXResult.Signature.Value, resp.TSSTXResult.LogTime
-}
+// parseSignResponse moved to fiskalyparse.ParseSignResponse (2026-08-18 code
+// review) — see that function's doc comment for why signature and
+// log-timestamp extraction are deliberately independent.
 
 // --- unsigned-sale retry queue (mirrors ut-plugin-integration-webhook's delivery queue) ---
 
@@ -667,7 +682,7 @@ func exportDSFinVK(fromDate, toDate string) (ok bool, downloadInfo string) {
 		"to":               toDate,
 		"format":           format,
 	})
-	body, status, ok := httpCall("POST", dsfinvkBase+"/export", authHeader(token), reqBody)
+	body, status, ok := httpCall("POST", fiskalyparse.DsfinvkBase+"/export", authHeader(token), reqBody)
 	if !ok || status < 200 || status >= 300 {
 		logf("tax-de: dsfinvk export trigger failed status=%d ok=%v", status, ok)
 		return false, ""
@@ -681,7 +696,7 @@ func exportDSFinVK(fromDate, toDate string) (ok bool, downloadInfo string) {
 		logf("tax-de: dsfinvk export response missing id")
 		return false, ""
 	}
-	logf("tax-de: dsfinvk export triggered id=%s state=%s (poll GET %s/export/%s for completion — not implemented here, generating can take up to an hour per fiskaly docs)", exportResp.ID, exportResp.State, dsfinvkBase, exportResp.ID)
+	logf("tax-de: dsfinvk export triggered id=%s state=%s (poll GET %s/export/%s for completion — not implemented here, generating can take up to an hour per fiskaly docs)", exportResp.ID, exportResp.State, fiskalyparse.DsfinvkBase, exportResp.ID)
 	return true, exportResp.ID
 }
 
