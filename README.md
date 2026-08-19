@@ -23,11 +23,11 @@ vs. "researched, not tested":
 |---|---|
 | SIGN DE (TSE signing): host, auth, TSS/client/transaction lifecycle, `standard_v1` receipt schema | **Confirmed 2026-08-18** against a real fiskaly TEST-environment sandbox: auth → create TSS → initialize → create/register a client → start+finish a transaction (19% VAT, card) → retrieved with a valid ECDSA signature. Fixed two real bugs this uncovered: `signDEBase` was pointed at `kassensichv.io`, now confirmed **dead** (plain 404 on every path, not fiskaly's server anymore) — corrected to `kassensichv-middleware.fiskaly.com/api/v2`; `parseSignResponse` was reading the signature from a `tss_tx_result` wrapper that doesn't exist in the real response (it's top-level `signature.value`) — would have silently discarded every real signature even with a working host. See `src/main.go` doc comments for exactly what was and wasn't exercised (e.g. only the `NORMAL` VAT bucket, not `REDUCED_1`/`NULL`/`SPECIAL_RATE_1`; this test's own curl script used a 3-call start/update/finish sequence, while this plugin's code uses a 2-call start/finish sequence — architecturally consistent with fiskaly's revision model but not independently re-verified). |
 | DSFinV-K export: endpoint paths/request shapes | **Researched, not tested — unchanged by the 2026-08-18 fix.** Still points at `kassensichv.io` (now confirmed dead), and may need a genuinely different host from SIGN DE's, not just a different path — see `dsfinvkBase`'s doc comment in `src/main.go`. Every endpoint here remains flagged `NEEDS SANDBOX VERIFICATION`. |
-| Tested against a real fiskaly sandbox/production account | **Partially done, 2026-08-18.** SIGN DE's raw API contract was exercised directly (see row above) — the *compiled plugin* has not yet been run end-to-end through `universal-till`'s real event bus/wazero runtime (see the end-to-end row below), and DSFinV-K has not been touched at all. |
+| Tested against a real fiskaly sandbox/production account | **Partially done, 2026-08-18.** SIGN DE's raw API contract was exercised directly (see row above). The compiled plugin now runs through a real wazero runtime (see the end-to-end row below) but against a *stubbed* HTTP layer, not live fiskaly — the two halves are each verified, their combination is not. DSFinV-K has not been touched at all. |
 | DSFinV-K export format/content is legally compliant | **Not verified, at all.** No DSFinV-K output from this plugin has been checked against the DSFinV-K spec or a real tax audit. |
 | KassenSichV compliance overall | **Not certified.** This is a starting skeleton. A merchant must get real legal/tax-advisor sign-off before relying on this for a live business — this plugin existing does not make a till KassenSichV-compliant. |
 | `go build ./...` / `scripts/build.sh` | **Confirmed** — builds clean as of this commit (see CI). |
-| End-to-end behavior against the till's real event bus | **Partially verified.** The `sale.completed`/TSE-signing path has NOT been exercised against `universal-till`'s actual `WasmRuntime.HandleEvent`. The `tax.rate.ask` handler HAS been run against the compiled `bin/plugin.wasm` through a real wazero runtime (same engine `universal-till` uses) with a minimal host-function stub — verified event dispatch, a settings lookup, and the exact stdout JSON shape core expects, for all three cases (dine-in declines, takeaway with a configured override answers, takeaway with no override declines). That stub is NOT `universal-till`'s actual host function implementations or a real installed-plugin flow through the till's UI — closer than untested, not the same as verified live. |
+| End-to-end behavior against the till's real event bus | **Partially verified, and now covered by a committed test suite** (`src/wasmrun`, 2026-08-19). The `fiscal.sign.ask` path is exercised against the REAL compiled `plugin.wasm` in a real wazero runtime (same engine `universal-till` uses) with stubbed host functions: event dispatch, settings lookup, the auth→start(`tx_revision=1`)→finish(`tx_revision=2`) call order, the exact money in the signed body, and the exact stdout JSON for the approved path plus three failure paths (fiskaly 5xx, unconfigured, malformed payload). The earlier `tax.rate.ask` wazero run was ad-hoc and uncommitted; this one is a real test that fails if the hook is removed (verified by deliberately deleting the dispatch). Still NOT proven: `universal-till`'s actual host-function implementations, a real installed-plugin flow through the till UI, and the HTTP layer here is a stub rather than live fiskaly (that contract was verified separately, see the SIGN DE row). |
 | DATEV EXTF file structure (31-field header row 1, 125-column header row 2, semicolon-delimited, Windows-1252, CRLF) | **Confirmed against a real reference file** (github.com/ledermann/datev's `EXTF_Buchungsstapel.csv`, byte-verified 2026-08-01), not reconstructed from memory — see `src/datev/datev.go`'s package doc comment. An independent review caught an early draft undercounting header row 1's trailing fields (27 vs. the real 31); fixed and pinned by `TestHeader1_FieldCount`. Unit-tested (`go test ./src/datev/...`), including a Windows-1252 round-trip check on the umlaut/en-dash header text. |
 | DATEV format-version numbers (`700`/`21`/`13`) and Soll/Haben booking convention (Kasse debited, Erlöskonto credited via an Automatikkonto, no BU-Schlüssel by default) | **Researched, not confirmed against DATEV's current published spec** (developer.datev.de 403'd when fetched) or a real accountant/DATEV import. Matches the reference file and common SKR03/04 practice, but NEEDS ACCOUNTANT VERIFICATION before a real filing. |
 | DATEV chart-of-accounts mapping (which Konto/Gegenkonto number per tax rate) | **Never guessed.** No default real account numbers anywhere in this plugin — `datev_konto_kasse`/`datev_erloeskonten` are merchant/accountant-configured settings; the export refuses (with a clear error) rather than emit an unconfigured or invented account number. |
@@ -288,28 +288,42 @@ about it needed a sandbox account.
    triggered DSFinV-K export is actually complete, and implement polling +
    a real downloadable result once fiskaly's async export finishes (Known
    gaps #2) — today's `export.requested.ask` response is trigger-only.
-5. **Test the TSE/DSFinV-K paths against the real wazero host runtime**,
-   not just `go build` — the way `ut-plugin-payment-sumup` was verified
-   before its reader-checkout path shipped, and the way `tax.rate.ask` now
-   has been (see the status table).
-6. **Build a settings UI for `takeaway_rate_overrides`** — today it's a raw
+5. ~~**Test the TSE/DSFinV-K paths against the real wazero host runtime**~~
+   — **done for TSE signing** (2026-08-19, ut-docs#818): `src/wasmrun` is a
+   committed wazero suite over the real compiled wasm. **Still open for
+   DSFinV-K**, which remains entirely unexercised.
+6. **Send the full §6 TSE evidence, not just signature + log time.** The
+   `fiscal.sign.ask` response carries only the two fields whose paths were
+   actually verified against a real fiskaly response. `transaction_number`,
+   `signature_counter`, `serial_number`, `start_time` and
+   `signature_algorithm` are omitted on purpose rather than guessed —
+   fiskaly's own Postman collection documents those on the TSS and client
+   resources, not on the transaction finish response. The contract makes
+   every field optional and keys presence on `signature`, so partial
+   evidence is valid; but a German receipt is supposed to show them, and a
+   wrong value there would be worse than an absent one. Needs one live
+   sandbox call to read the real finish-response shape.
+7. **Verify the remaining VAT buckets against the sandbox.** Only `NORMAL`
+   has been exercised live; `REDUCED_1` / `NULL` / `SPECIAL_RATE_1` are
+   unit-tested for mapping but never round-tripped through fiskaly.
+8. **Build a settings UI for `takeaway_rate_overrides`** — today it's a raw
    JSON text field, no form to pick a tax code from the shop's actual
    catalog and set its takeaway rate. A real merchant can't use this
    feature without either that UI or editing plugin settings by hand.
-7. **Get the DATEV export's chart-of-accounts mapping confirmed by the
+9. **Get the DATEV export's chart-of-accounts mapping confirmed by the
    merchant's actual accountant** before relying on it for a real filing —
    `datev_konto_kasse`/`datev_erloeskonten` are configuration this plugin
    never guesses, but a wrong number entered by whoever configures it would
    still mis-book real accounting records; a real accountant should
    confirm the values, not just that the fields are filled in.
-8. **Confirm the DATEV format-version numbers and Soll/Haben booking
+10. **Confirm the DATEV format-version numbers and Soll/Haben booking
    convention** (`src/datev/datev.go`'s package doc comment) against
    DATEV's current published "Formatbeschreibung: Buchungsstapel" and a
    real DATEV import test — this plugin's file is structurally grounded in
    a real reference export, not verified end-to-end.
-9. **Decide whether DATEV export should split Konto by payment method**
+11. **Decide whether DATEV export should split Konto by payment method**
    (Known gap #5) instead of posting every sale to one Kasse/Bank account.
-10. **Push sale-level discounts down into `sale_lines`** (Known gap #7) so a
+12. **Push sale-level discounts down into `sale_lines`** (Known gap #7) so a
     discounted sale's tax-line sum reconciles with its total — until then,
     any period containing a discounted sale can't be DATEV-exported at all.
 
@@ -319,7 +333,11 @@ about it needed a sandbox account.
 bash scripts/build.sh   # -> bin/plugin.wasm (GOOS=wasip1 GOARCH=wasm)
 ```
 
-`go build ./...` from the repo root matches every sibling plugin repo's
-behavior: it prints `go: warning: "./..." matched no packages` and exits 0,
-because `src/main.go` is gated `//go:build wasip1` — the real build check is
-`scripts/build.sh`, which cross-compiles for the actual target.
+`go build ./...` from the repo root now builds the host-side packages
+(`src/datev`, `src/fiskalyparse`, `src/fiscalsign`, and the `src/wasmrun`
+test package) and silently skips `src/main.go`, which is gated
+`//go:build wasip1`. It therefore does NOT prove the plugin itself compiles
+— the real build check is still `scripts/build.sh`, which cross-compiles for
+the actual target. (Before 2026-08-19 this repo had only `src/datev` outside
+the build tag and the command printed `go: warning: "./..." matched no
+packages`; that is no longer what you will see.)

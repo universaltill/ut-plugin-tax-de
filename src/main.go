@@ -74,6 +74,7 @@ import (
 	"unsafe"
 
 	"github.com/universaltill/ut-plugin-tax-de/src/datev"
+	"github.com/universaltill/ut-plugin-tax-de/src/fiscalsign"
 	"github.com/universaltill/ut-plugin-tax-de/src/fiskalyparse"
 )
 
@@ -311,50 +312,11 @@ type saleCompletedEvent struct {
 
 // --- TSE signing (SIGN DE API) ---
 
-// vatRateBucket maps a basis-point VAT rate to fiskaly's SIGN DE
-// `standard_v1` schema vat_rate enum. Germany's rates today: 19% (NORMAL),
-// 7% (REDUCED_1). Anything else falls back to SPECIAL_RATE_1 rather than
-// guessing further — fiskaly's enum also has REDUCED_2/NULL/SPECIAL_RATE_2-5
-// for cases (e.g. 0%) this skeleton doesn't attempt to classify.
-//
-// CONFIRMED 2026-08-18: the standard_v1 schema shape (amounts_per_vat_rate /
-// amounts_per_payment_type field names, sent with vat_rate="NORMAL" and
-// payment_type="NON_CASH") was accepted by a live fiskaly sandbox and echoed
-// back correctly in the signed transaction. NEEDS SANDBOX VERIFICATION
-// still: the REDUCED_1/NULL/SPECIAL_RATE_1 enum values below were not
-// exercised (only NORMAL was) — no reason to expect they're wrong, just not
-// independently proven the way NORMAL now is.
-func vatRateBucket(bp int) string {
-	switch bp {
-	case 1900:
-		return "NORMAL"
-	case 700:
-		return "REDUCED_1"
-	case 0:
-		return "NULL"
-	default:
-		return "SPECIAL_RATE_1"
-	}
-}
-
-// paymentTypeBucket maps the till's free-text payment method to fiskaly's
-// CASH/NON_CASH split (that's the granularity the TSE schema actually
-// cares about — everything that isn't physical cash is NON_CASH).
-func paymentTypeBucket(method string) string {
-	if strings.EqualFold(method, "cash") {
-		return "CASH"
-	}
-	return "NON_CASH"
-}
-
-func minorToDecimalString(cents int64) string {
-	sign := ""
-	if cents < 0 {
-		sign = "-"
-		cents = -cents
-	}
-	return fmt.Sprintf("%s%d.%02d", sign, cents/100, cents%100)
-}
+// The VAT/payment bucket mapping and minor-unit formatting moved to
+// src/fiscalsign (2026-08-19, ut-docs#818) so they are unit-testable on the
+// host -- this file is wasip1-only and cannot be tested directly. They are
+// also the fiskaly-shaped part of the seam ADR-0055 requires, i.e. what a
+// future config-selected second provider would replace.
 
 // txID derives a fiskaly transaction id from the sale id. SIGN DE's
 // /tss/{tss_id}/tx/{tx_id} path segment must be a UUID in fiskaly's docs
@@ -408,7 +370,19 @@ type tseSignResult struct {
 // specific count of them before FINISHED) but was not itself run against
 // live fiskaly — worth confirming if a real sign attempt ever fails at the
 // finish step specifically.
-func signTransaction(sale saleCompletedEvent, apiKey, apiSecret, tssID, clientID string) tseSignResult {
+// signInput is the provider-neutral view of a sale to be signed. Both
+// entry points build one: the real fiscal.sign.ask answerer, and the
+// legacy sale.completed path. Keeping signTransaction off the raw event
+// structs is what lets the two hooks share one signing implementation --
+// and is the seam ADR-0055 asks for.
+type signInput struct {
+	SaleID   string
+	SaleType string
+	VAT      []fiscalsign.VATAmount
+	Payments []fiscalsign.PaymentAmount
+}
+
+func signTransaction(sale signInput, apiKey, apiSecret, tssID, clientID string) tseSignResult {
 	result := tseSignResult{SaleID: sale.SaleID, AttemptedAt: time.Now().UTC()}
 
 	if tssID == "" || clientID == "" {
@@ -436,24 +410,13 @@ func signTransaction(sale saleCompletedEvent, apiKey, apiSecret, tssID, clientID
 		return result
 	}
 
-	// 2. Finish the transaction with the receipt schema (vat-rate and
-	//    payment-type breakdown built from the real sale line items/payments).
-	vatBuckets := map[string]int64{}
-	for _, li := range sale.LineItems {
-		vatBuckets[vatRateBucket(li.TaxRateBP)] += li.TotalCents
-	}
-	payBuckets := map[string]int64{}
-	for _, p := range sale.Payments {
-		payBuckets[paymentTypeBucket(p.Method)] += p.AmountCents
-	}
-	amountsPerVAT := make([]map[string]string, 0, len(vatBuckets))
-	for rate, cents := range vatBuckets {
-		amountsPerVAT = append(amountsPerVAT, map[string]string{"vat_rate": rate, "amount": minorToDecimalString(cents)})
-	}
-	amountsPerPayment := make([]map[string]string, 0, len(payBuckets))
-	for typ, cents := range payBuckets {
-		amountsPerPayment = append(amountsPerPayment, map[string]string{"payment_type": typ, "amount": minorToDecimalString(cents)})
-	}
+	// 2. Finish the transaction with the receipt schema. The vat-rate and
+	//    payment-type breakdowns are computed by the caller (src/fiscalsign,
+	//    unit-tested) and arrive already bucketed and deterministically
+	//    ordered, so the same sale always produces the same request body --
+	//    which matters because a background retry re-signs the same sale.
+	amountsPerVAT := sale.VAT
+	amountsPerPayment := sale.Payments
 	receiptType := "RECEIPT"
 	if sale.SaleType == "return" {
 		receiptType = "RECEIPT_0104" // best-effort: fiskaly's return/cancellation receipt type code, NOT confirmed
@@ -536,7 +499,7 @@ func handleSaleCompleted(raw []byte) {
 		if err := json.Unmarshal(p, &s); err != nil {
 			continue
 		}
-		res := signTransaction(s, apiKey, apiSecret, tssID, clientID)
+		res := signTransaction(signInputFromSaleCompleted(s), apiKey, apiSecret, tssID, clientID)
 		recordResult(res)
 		if !res.Signed {
 			stillUnsigned = append(stillUnsigned, p)
@@ -555,7 +518,7 @@ func handleSaleCompleted(raw []byte) {
 		_ = json.Unmarshal(ev.Payload, &sale)
 	}
 	if sale.SaleID != "" {
-		res := signTransaction(sale, apiKey, apiSecret, tssID, clientID)
+		res := signTransaction(signInputFromSaleCompleted(sale), apiKey, apiSecret, tssID, clientID)
 		recordResult(res)
 		if res.Signed {
 			logf("tax-de: SIGNED sale %s tx=%s", sale.SaleID, res.TxID)
@@ -598,6 +561,97 @@ type taxRateAskPayload struct {
 // JSON value directly (same pre-existing gap noted in universal-till's
 // docs/code-reviews/2026-07-28-order-type-tax-switching.md, now on the
 // plugin side instead of core's) — a real follow-up, not built here.
+// signInputFromSaleCompleted adapts the legacy, non-blocking
+// sale.completed event onto the shared signing path. It reuses
+// src/fiscalsign's bucket mapping so both hooks bucket identically --
+// previously this mapping lived inline here and existed in only one place
+// by accident rather than by design.
+func signInputFromSaleCompleted(sale saleCompletedEvent) signInput {
+	vatLines := make([]fiscalsign.VATLine, 0, len(sale.LineItems))
+	for _, li := range sale.LineItems {
+		// sale.completed carries gross per line (TotalCents) with no
+		// net/tax split, so the gross goes in Net and Tax stays 0 --
+		// fiscalsign sums Net+Tax, which yields the same gross figure this
+		// path has always sent.
+		vatLines = append(vatLines, fiscalsign.VATLine{RateBP: li.TaxRateBP, Net: li.TotalCents})
+	}
+	payments := make([]fiscalsign.Payment, 0, len(sale.Payments))
+	for _, p := range sale.Payments {
+		payments = append(payments, fiscalsign.Payment{Method: p.Method, Amount: p.AmountCents})
+	}
+	req := fiscalsign.Request{VATBreakdown: vatLines, Payments: payments}
+	return signInput{
+		SaleID:   sale.SaleID,
+		SaleType: sale.SaleType,
+		VAT:      fiscalsign.VATAmounts(req),
+		Payments: fiscalsign.PaymentAmounts(req),
+	}
+}
+
+// handleFiscalSignAsk answers core's real TSE-signing extension point
+// (ut-docs#818; contract fiscal-sign-ask.md v1.1.0, registered by ADR-0044
+// Decision 1). This -- not sale.completed -- is what makes core see a
+// fiscal signer as installed at all.
+//
+// Failure policy is core's, not ours: on any failure we answer
+// "unreachable" and core applies proceed-and-declare (sale completes,
+// journaled unsigned, receipt notice, operator alert, background retry).
+// We never block the sale and never fabricate a signature.
+func handleFiscalSignAsk(raw []byte) {
+	req, err := fiscalsign.ParseRequest(raw)
+	if err != nil {
+		// Fail closed: an unreadable request means signing is unproven.
+		logf("tax-de: fiscal.sign.ask: %v -- answering unreachable", err)
+		fmt.Print(string(fiscalsign.Unreachable().JSON()))
+		os.Exit(0)
+	}
+
+	apiKey := strings.TrimSpace(setting("fiskaly_api_key"))
+	apiSecret := strings.TrimSpace(setting("fiskaly_api_secret"))
+	tssID := strings.TrimSpace(setting("fiskaly_tss_id"))
+	clientID := strings.TrimSpace(setting("fiskaly_client_id"))
+
+	if apiKey == "" || apiSecret == "" || tssID == "" || clientID == "" {
+		// Not configured is NOT "not-this-terminal": that status means "no
+		// opinion" and would let the sale pass with no marker at all. A
+		// German till with an unconfigured signer must still surface the
+		// gap, so declare it unreachable and let core declare + retry.
+		logf("tax-de: fiscal.sign.ask: fiskaly settings incomplete -- answering unreachable")
+		fmt.Print(string(fiscalsign.Unreachable().JSON()))
+		os.Exit(0)
+	}
+
+	in := signInput{
+		SaleID:   req.SaleID,
+		VAT:      fiscalsign.VATAmounts(req),
+		Payments: fiscalsign.PaymentAmounts(req),
+	}
+	res := signTransaction(in, apiKey, apiSecret, tssID, clientID)
+	recordResult(res)
+
+	if !res.Signed {
+		logf("tax-de: fiscal.sign.ask: sale %s NOT signed (%s) -- answering unreachable", req.SaleID, res.FailureReason)
+		fmt.Print(string(fiscalsign.Unreachable().JSON()))
+		os.Exit(0)
+	}
+
+	// Evidence: only the fields this plugin has actually VERIFIED against a
+	// real fiskaly response are sent (signature, log_time -- confirmed
+	// 2026-08-18). transaction_number / signature_counter / serial_number /
+	// start_time / signature_algorithm are deliberately omitted rather than
+	// guessed: fiskaly's own Postman collection documents those on the TSS
+	// and client resources, NOT on the transaction finish response, so their
+	// paths here are unknown. The contract makes every tse field optional
+	// and keys presence on `signature` alone, so partial evidence is valid
+	// -- and a wrong value on a §6 KassenSichV receipt is worse than an
+	// absent one. Tracked as follow-up, see README.
+	fmt.Print(string(fiscalsign.Approved(fiscalsign.TSEEvidence{
+		Signature: res.SignatureB64,
+		LogTime:   res.LogTime,
+	}).JSON()))
+	os.Exit(0)
+}
+
 func handleTaxRateAsk(raw []byte) {
 	var wrapper struct {
 		Payload json.RawMessage `json:"payload"`
@@ -792,6 +846,9 @@ func main() {
 	switch {
 	case ev.Type == "sale.completed":
 		handleSaleCompleted(raw)
+
+	case ev.Type == "fiscal.sign.ask":
+		handleFiscalSignAsk(raw)
 
 	case ev.Type == "tax.rate.ask":
 		handleTaxRateAsk(raw)

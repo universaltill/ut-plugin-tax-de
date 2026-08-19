@@ -24,22 +24,31 @@ doesn't match fiskaly's real payload (`signature.value`, top-level) — that
 second bug alone would have made every real sign attempt silently fail even
 once the host was fixed.
 
-**This does not make the plugin the till's real TSE signer.**
-`universal-till` core's actual TSE-signing extension point is a different,
-newer hook, `fiscal.sign.ask` (ADR-0041/044/048, blocking, exclusive
-between signer plugins, persists evidence, renders it on the receipt, gates
-the ADR-0048 system-of-record check — see
-`ut-docs/reference/contracts/fiscal-sign-ask.md`,
-`universal-till/internal/pages/fiscal_sign_hook.go`). This plugin only
-declares `sale.completed` in `manifest.json`'s `hooks[]` and does not
-subscribe to `fiscal.sign.ask` at all — so core currently sees **zero
-fiscal signers installed**, regardless of this fix. This plugin's own
-fiskaly connection now genuinely works (real auth, real signature), but
-it's entirely disconnected from the till's real receipts/compliance gate.
-Wiring this plugin to `fiscal.sign.ask` is real, separate, higher-priority
-follow-up work — not done here, and code review (2026-08-18) confirmed the
-2026-08-18 fix makes it more urgent, not less, since the fiskaly side is now
-demonstrably functional.
+**This IS now the till's real TSE signer (2026-08-19, ut-docs#818).**
+Superseding the previous note here, which said the opposite: `manifest.json`
+now declares **`fiscal.sign.ask`** — core's actual TSE-signing extension
+point (ADR-0041/0044/0048; blocking, exclusive between signer plugins,
+persists evidence, renders it on the receipt, gates the ADR-0048
+system-of-record check — see `ut-docs/reference/contracts/fiscal-sign-ask.md`
+and `universal-till/internal/pages/fiscal_sign_hook.go`). Core therefore
+sees a fiscal signer installed; previously it saw **zero**, so every sale
+took the `fiscalSignNoSigner` path no matter how well the fiskaly call
+worked.
+
+**ADR-0055 decided signing stays in THIS plugin.** ADR-0044 Decision 3 had
+called for splitting signing into a separate `ut-plugin-tax-fiskaly` repo;
+that is withdrawn. If a second backend is ever needed it becomes a
+**config-selected provider inside this plugin**, not a new repo — which is
+why the pure mapping lives in `src/fiscalsign` (the provider seam) rather
+than inline in `main.go`. One real limit is recorded in that ADR: a
+*hardware* TSE (Swissbit) still cannot live here, because it needs
+`runtime:"go"` for raw USB and this plugin is `wasm`; that is the moment to
+split, and it is blocked on #605 regardless.
+
+`sale.completed` is **kept** alongside it, deliberately — it still drives
+this plugin's own `unsigned_queue` retry bookkeeping and its `tse_result:*`
+audit records. Both hooks now share one signing implementation through
+`signInput`/`signTransaction`, so they can never bucket money differently.
 
 DSFinV-K export is unchanged and still fully unverified — every endpoint
 in `src/main.go` for it is grounded in fiskaly's **public** documentation
@@ -100,10 +109,29 @@ export" bullet and its Known gaps #5/#6.
 ## Code layout
 
 - `src/main.go` — single WASI command, dispatches on the event JSON's
-  `type` field (`sale.completed` → `handleSaleCompleted`; `tax.rate.ask` →
+  `type` field (**`fiscal.sign.ask` → `handleFiscalSignAsk`, the real TSE
+  signing point**; `sale.completed` → `handleSaleCompleted`; `tax.rate.ask` →
   `handleTaxRateAsk`, the dine-in/takeaway VAT switch, verified against a
   real wazero run — see README's status table; `export.requested.ask` →
   `handleDSFinVKExport` or `handleDATEVExport` depending on `entry_key`).
+- `src/fiscalsign/` — the pure, host-independent half of the
+  `fiscal.sign.ask` answerer: contract wire types, and the VAT/payment
+  bucket mapping onto fiskaly's `standard_v1` schema. Its own package with
+  no wasip1 tag, so `go test ./src/fiscalsign/...` runs on the host —
+  `main.go` itself cannot be unit-tested at all (`//go:wasmimport`). Also
+  the provider seam ADR-0055 requires: this is the fiskaly-shaped part a
+  future config-selected second provider would replace. **Two invariants
+  are pinned by tests and must not regress**: the amount signed per VAT
+  bucket is GROSS (`net + tax`, not net — sending net under-declares every
+  sale), and a payment's tip is included in its signed total.
+- `src/wasmrun/` — test-only. Runs the REAL compiled `plugin.wasm` through
+  a real wazero runtime with stubbed host functions, asserting the
+  `fiscal.sign.ask` request bodies and the exact stdout JSON for the
+  approved and failure paths. Note it explicitly `os.ReadFile`s the
+  guest sources: the wasm is built by a subprocess, so without that the
+  go command's result cache does not treat `main.go` as an input, and the
+  suite will happily cache a PASS across a change that deletes the hook
+  (observed for real, 2026-08-19). Don't remove those reads.
 - `src/datev/` — DATEV EXTF Buchungsstapel file-building logic, deliberately
   its OWN package with no `//go:build wasip1` tag (unlike `src/main.go`) so
   `go test ./src/datev/...` runs on the host with no wasm build — the only
@@ -138,9 +166,10 @@ export" bullet and its Known gaps #5/#6.
 
 ## Before committing
 
-- `go test ./...` (now real — `src/datev` has no build tag; every other
-  package here is `main`/wasip1-only and stays untested by this command,
-  same as before).
+- `go test ./...` — now covers `src/datev`, `src/fiskalyparse`,
+  `src/fiscalsign` and `src/wasmrun` (the last actually compiles and runs
+  the plugin as wasm, so it is slower than the rest; `src/main.go` remains
+  untestable directly, wasip1-only).
 - `bash scripts/build.sh` (the real build check — cross-compiles
   `GOOS=wasip1 GOARCH=wasm`).
 - `bash scripts/validate.sh` (manifest shape: `canonical_type: tax`,
