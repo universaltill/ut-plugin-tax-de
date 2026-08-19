@@ -339,3 +339,60 @@ func TestStatusConstantsMatchTheContract(t *testing.T) {
 			StatusApproved, StatusUnreachable, StatusNotThisTerminal)
 	}
 }
+
+// --- balance invariant (ut-docs#818 review finding B1) ---
+//
+// fiskaly's standard_v1 receipt becomes a DSFinV-K Kassenbeleg-V1 string
+// whose two halves must be equal: `Beleg^<gross per VAT rate>^<per payment
+// type>`. A receipt where they disagree is either rejected by fiskaly or —
+// worse — signed into an irreversible record that misstates the sale.
+
+func TestBalanceDelta_PlainSaleBalances(t *testing.T) {
+	req := Request{
+		Total:        1190,
+		Payments:     []Payment{{Method: "card", Amount: 1190}},
+		VATBreakdown: []VATLine{{RateBP: 1900, Net: 1000, Tax: 190}},
+	}
+	if d := BalanceDelta(req); d != 0 {
+		t.Errorf("BalanceDelta = %d, want 0 for a plain sale", d)
+	}
+}
+
+// The exact defect the review found: a tip lands on the payment side and in
+// no VAT bucket, so the two halves differ by the tip.
+func TestBalanceDelta_TipUnbalances(t *testing.T) {
+	req := Request{
+		Total:        1190,
+		Payments:     []Payment{{Method: "card", Amount: 1190, TipAmount: 100}},
+		VATBreakdown: []VATLine{{RateBP: 1900, Net: 1000, Tax: 190}},
+	}
+	if d := BalanceDelta(req); d != -100 {
+		t.Errorf("BalanceDelta = %d, want -100 (payments exceed VAT by the tip)", d)
+	}
+}
+
+// A sale-level discount reduces `total` (and so the payments) but not the
+// per-line VAT breakdown, which the contract states is computed before it.
+func TestBalanceDelta_SaleLevelDiscountUnbalances(t *testing.T) {
+	req := Request{
+		Total:        990,
+		Payments:     []Payment{{Method: "cash", Amount: 990}},
+		VATBreakdown: []VATLine{{RateBP: 1900, Net: 1000, Tax: 190}},
+	}
+	if d := BalanceDelta(req); d != 200 {
+		t.Errorf("BalanceDelta = %d, want 200 (VAT side exceeds what was paid)", d)
+	}
+}
+
+func TestBalanceDelta_MixedRatesBalance(t *testing.T) {
+	req := Request{
+		Payments: []Payment{{Method: "cash", Amount: 500}, {Method: "card", Amount: 868}},
+		VATBreakdown: []VATLine{
+			{RateBP: 1900, Net: 700, Tax: 133},
+			{RateBP: 700, Net: 500, Tax: 35},
+		},
+	}
+	if d := BalanceDelta(req); d != 0 {
+		t.Errorf("BalanceDelta = %d, want 0 (833 + 535 == 500 + 868)", d)
+	}
+}

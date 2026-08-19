@@ -2,7 +2,7 @@
 
 A WASM (`GOOS=wasip1 GOARCH=wasm`) plugin implementing Germany's KassenSichV
 fiscal requirements: TSE signing via fiskaly's Cloud-TSE ("SIGN DE") API
-(`canonical_type: tax`, hooks `sale.completed`) + DSFinV-K export via
+(`canonical_type: tax`, hooks `fiscal.sign.ask`) + DSFinV-K export via
 fiskaly's DSFinV-K API (`canonical_type: tax`, second `entries[]` item typed
 `export`, per ADR-0025's guidance to map both onto ADR-0002's existing
 taxonomy in one manifest rather than invent a new type). First fiscal
@@ -45,10 +45,30 @@ than inline in `main.go`. One real limit is recorded in that ADR: a
 `runtime:"go"` for raw USB and this plugin is `wasm`; that is the moment to
 split, and it is blocked on #605 regardless.
 
-`sale.completed` is **kept** alongside it, deliberately — it still drives
-this plugin's own `unsigned_queue` retry bookkeeping and its `tse_result:*`
-audit records. Both hooks now share one signing implementation through
-`signInput`/`signTransaction`, so they can never bucket money differently.
+**`sale.completed` was REMOVED**, along with this plugin's own
+`unsigned_queue`. An earlier draft kept both hooks; an independent review
+proved that combination corrupts every successful sale — core fires
+`fiscal.sign.ask` at tender and `sale.completed` after, `txID` is
+deterministic per sale, so the second hook re-`PUT`s an already-`FINISHED`
+fiskaly transaction, gets a 400, and then writes a false "fiskaly was NOT
+reached" log, overwrites `tse_result:<sale_id>` from signed to failed, and
+adds a permanent queue entry (queue grows to 200, then costs 200 failing
+round-trips per sale). Core now owns the whole failure surface properly
+— journal marker, receipt notice, operator alert, background re-ask with
+`retry: true` — so a private retry loop was redundant as well as harmful.
+**Do not re-add `sale.completed` for signing.**
+
+**The plugin REFUSES to sign an unbalanced receipt** (`fiscalsign.BalanceDelta`).
+fiskaly renders `standard_v1` into DSFinV-K's `Beleg^<gross per VAT
+rate>^<per payment type>`, whose halves must be equal — but a tip rides the
+payment side with no VAT bucket, and a sale-level discount/service charge
+moves `total` without moving the per-line `vat_breakdown`. So tipped and
+whole-bill-discounted sales currently do NOT sign, by design; they take
+core's declared-and-retried path instead. **This is not a bug to fix by
+picking a VAT bucket** — the correct German representation is an open
+accountant question (ut-docs#833). A TSE signature is irreversible, so
+signing a receipt already known to misstate the sale is worse than
+declaring the gap. Same rule as never fabricating a signature.
 
 DSFinV-K export is unchanged and still fully unverified — every endpoint
 in `src/main.go` for it is grounded in fiskaly's **public** documentation
@@ -63,22 +83,36 @@ with reality as verification happens (don't let a `NEEDS SANDBOX
 VERIFICATION` comment get resolved in code without also updating the README
 row it corresponds to).
 
-## The offline-first tension (do not "fix" this without a real decision)
+## The offline-first tension — RESOLVED (2026-08-19), do not re-open casually
 
-`sale.completed` is non-blocking and fires **after** the sale has already
-completed (confirmed against `universal-till/internal/plugins/ipc.go` /
-`wasm_runtime.go`: non-blocking dispatch discards the handler's return
-value — errors are logged, never retried, never surfaced to the operator).
-This plugin therefore has **no architectural way to block or reverse a sale
-if fiskaly is unreachable**, which is exactly the open question ADR-0025
-flags and explicitly does NOT resolve ("needs real legal/TSE-vendor
-confirmation, not assumed here"). The one hard rule this code follows
-instead: **never fabricate a signature**. A failed sign attempt is logged
-loudly and queued for retry (`unsigned_queue` in plugin storage, same
-bounded-queue pattern as `ut-plugin-integration-webhook`'s delivery queue) —
-if you touch `signTransaction` or `handleSaleCompleted`, preserve that
-invariant. Don't add a code path that marks a sale "signed" without a real
-2xx response containing a signature.
+**This section previously described a real architectural dead end. It no
+longer applies**, and is rewritten rather than deleted so the reasoning
+isn't lost.
+
+The old problem: `sale.completed` was non-blocking and fired *after* the
+sale completed, so the plugin had **no architectural way to block, reverse
+or even declare** a sale when fiskaly was unreachable — exactly the open
+question ADR-0025 flagged and refused to resolve. The plugin worked around
+it with a private `unsigned_queue`.
+
+The resolution is ADR-0044 Decision 1 plus ut-docs#818: the plugin now
+answers **`fiscal.sign.ask`**, a *blocking* tender-phase point with a
+3000 ms budget and a `proceed-and-declare` failure policy. Core, not the
+plugin, now guarantees the whole failure surface — audit-journal marker,
+receipt outage notice, operator alert, and background re-ask. A failure is
+therefore declared and visible, never silent, and the sale still never
+blocks on connectivity (ADR-0003 intact). The private queue is gone.
+
+**Two hard rules survive and must not regress:**
+
+1. **Never fabricate a signature.** `approved` is only ever answered after
+   a real 2xx carrying a real `signature.value`. Don't add a path that
+   marks a sale signed without one.
+2. **Never sign a receipt already known to be wrong.** If the VAT side and
+   the payment side don't balance, refuse and answer `unreachable`. A TSE
+   signature cannot be corrected afterwards, so a declared gap beats an
+   irreversible false record. See `fiscalsign.BalanceDelta` and
+   ut-docs#833.
 
 ## `export` canonical type has no host dispatcher yet
 
@@ -110,7 +144,7 @@ export" bullet and its Known gaps #5/#6.
 
 - `src/main.go` — single WASI command, dispatches on the event JSON's
   `type` field (**`fiscal.sign.ask` → `handleFiscalSignAsk`, the real TSE
-  signing point**; `sale.completed` → `handleSaleCompleted`; `tax.rate.ask` →
+  signing point**; `tax.rate.ask` →
   `handleTaxRateAsk`, the dine-in/takeaway VAT switch, verified against a
   real wazero run — see README's status table; `export.requested.ask` →
   `handleDSFinVKExport` or `handleDATEVExport` depending on `entry_key`).

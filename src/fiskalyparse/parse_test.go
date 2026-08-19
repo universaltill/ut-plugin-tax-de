@@ -5,6 +5,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -114,4 +115,73 @@ func TestSignDEBaseHostCoveredByManifestPermission(t *testing.T) {
 		}
 	}
 	t.Fatalf("SignDEBase host %q is not covered by any declared permission in manifest.json (want %q), got %v — a fiskaly call would be silently denied at runtime", u.Hostname(), want, m.Permissions)
+}
+
+// --- full §6 TSE evidence (ut-docs#818 review finding N3) ---
+//
+// Every field below is read from `realFinishedTransactionBody`, which is a
+// REAL response captured from the live fiskaly sandbox on 2026-08-18 — not
+// a hand-written guess. An earlier draft of the fiscal.sign.ask answerer
+// omitted these fields claiming their paths were "documented on the TSS and
+// client resources, not the transaction response"; that was wrong, and this
+// very fixture already contained all of them.
+func TestParseSignEvidence_RealCapturedResponse(t *testing.T) {
+	ev := ParseSignEvidence([]byte(realFinishedTransactionBody))
+
+	if ev.Signature != "kHCYf4/f/zz+51m5XlzLtuEOFvVyAF3wrzsz+p+iyQcxzICkza8O9m/P45pRDQRWwEvxYzYZQWR3wGqEsSf2iA==" {
+		t.Errorf("Signature = %q", ev.Signature)
+	}
+	if ev.SignatureAlgorithm != "ecdsa-plain-SHA256" {
+		t.Errorf("SignatureAlgorithm = %q, want ecdsa-plain-SHA256", ev.SignatureAlgorithm)
+	}
+	if ev.SignatureCounter != 27 {
+		t.Errorf("SignatureCounter = %d, want 27", ev.SignatureCounter)
+	}
+	if ev.TransactionNumber != 1 {
+		t.Errorf("TransactionNumber = %d, want 1", ev.TransactionNumber)
+	}
+	if ev.SerialNumber != "2be721cf1a255afd12626533e251fe7b3e3c8af625b9f12803918a9bb1952867" {
+		t.Errorf("SerialNumber = %q — it is tss_serial_number on the transaction body", ev.SerialNumber)
+	}
+	// RFC3339, per the contract. fiskaly sends unixTime and renders it as
+	// 2026-08-18T18:38:19Z in its own qr_code_data for this same response,
+	// so this is fiskaly's own interpretation of the value, not ours.
+	if ev.LogTime != "2026-08-18T18:38:19Z" {
+		t.Errorf("LogTime = %q, want RFC3339 2026-08-18T18:38:19Z", ev.LogTime)
+	}
+	if ev.StartTime != "2026-08-18T18:38:19Z" {
+		t.Errorf("StartTime = %q, want RFC3339 2026-08-18T18:38:19Z", ev.StartTime)
+	}
+}
+
+// A raw epoch on a receipt reads as "TSE transaction end: 1787078299" to a
+// shop owner and to a tax auditor. Guard the format explicitly.
+func TestParseSignEvidence_TimestampsAreNeverRawEpoch(t *testing.T) {
+	ev := ParseSignEvidence([]byte(realFinishedTransactionBody))
+	for name, got := range map[string]string{"LogTime": ev.LogTime, "StartTime": ev.StartTime} {
+		if got == "" {
+			t.Errorf("%s is empty", name)
+			continue
+		}
+		if !strings.Contains(got, "T") || !strings.HasSuffix(got, "Z") {
+			t.Errorf("%s = %q — not RFC3339", name, got)
+		}
+	}
+}
+
+func TestParseSignEvidence_MissingFieldsStayZero(t *testing.T) {
+	ev := ParseSignEvidence([]byte(`{"signature":{"value":"SIG=="}}`))
+	if ev.Signature != "SIG==" {
+		t.Errorf("Signature = %q", ev.Signature)
+	}
+	if ev.LogTime != "" || ev.StartTime != "" || ev.SerialNumber != "" ||
+		ev.SignatureCounter != 0 || ev.TransactionNumber != 0 || ev.SignatureAlgorithm != "" {
+		t.Errorf("absent fields must stay zero, got %+v", ev)
+	}
+}
+
+func TestParseSignEvidence_Garbage(t *testing.T) {
+	if ev := ParseSignEvidence([]byte(`not json`)); ev.Signature != "" {
+		t.Errorf("garbage must yield no signature, got %+v", ev)
+	}
 }

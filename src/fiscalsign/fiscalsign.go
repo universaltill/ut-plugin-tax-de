@@ -253,3 +253,39 @@ func Unreachable() Response { return Response{Status: StatusUnreachable} }
 // Core treats it exactly like no answer — the sale proceeds with no
 // marker. Explicitly NOT a failure.
 func NotThisTerminal() Response { return Response{Status: StatusNotThisTerminal} }
+
+// BalanceDelta returns, in minor units, how far the VAT side and the
+// payment side of the signed receipt are from agreeing:
+//
+//	sum(VAT gross) - sum(payment amounts including tips)
+//
+// Zero means the receipt balances. Anything else means we are about to ask
+// a TSE to sign a receipt whose own two halves disagree.
+//
+// Why this exists (ut-docs#818 independent review): fiskaly's standard_v1
+// receipt is rendered into DSFinV-K's `Kassenbeleg-V1` process-data string,
+// `Beleg^<gross per VAT rate>^<per payment type>`, whose halves must be
+// equal — fiskaly's own examples always balance. Core can legitimately hand
+// us an unbalanced request: `vat_breakdown` is computed per line, before
+// any sale-level discount or service charge, while `total` and the payments
+// include them, and a tip is carried on the payment side with no VAT bucket
+// at all (the contract says so itself). The difference is therefore
+// `saleDiscount - serviceCharge - tips`.
+//
+// How a non-zero delta must be handled is deliberately NOT decided here: it
+// is a German tax question (which VAT rate does a tip attract? is it the
+// business's revenue or the employee's? how is a whole-bill discount
+// apportioned across rates?), asked of a real accountant in ut-docs#833.
+// Until that is answered, the caller refuses to sign — the same principle
+// as never fabricating a signature: do not sign a receipt already known to
+// be wrong, because a TSE signature cannot be corrected afterwards.
+func BalanceDelta(req Request) int64 {
+	var vat, paid int64
+	for _, l := range req.VATBreakdown {
+		vat += l.Net + l.Tax
+	}
+	for _, p := range req.Payments {
+		paid += p.Amount + p.TipAmount
+	}
+	return vat - paid
+}

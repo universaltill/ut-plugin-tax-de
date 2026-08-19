@@ -255,8 +255,10 @@ func configuredHost(respond func(httpCall) (int, string, bool)) *stubHost {
 const finishedResponse = `{
   "number": 4711,
   "state": "FINISHED",
+  "tss_serial_number": "TSS-SERIAL-9d5e",
+  "time_start": 1755253860,
   "signature": {"value": "MEQCIFakeSignature==", "counter": 12345, "algorithm": "ecdsa-plain-SHA256"},
-  "log": {"timestamp": 1755253862}
+  "log": {"timestamp": 1755253862, "timestamp_format": "unixTime"}
 }`
 
 func scriptedFiskaly(t *testing.T) func(httpCall) (int, string, bool) {
@@ -280,9 +282,9 @@ const signAskEvent = `{
   "payload": {
     "sale_id": "sale-abc",
     "currency": "EUR",
-    "total": 1290,
+    "total": 1368,
     "tendered_at": "2026-08-19T10:31:02Z",
-    "payments": [{"method": "card", "amount": 1190, "tip_amount": 100}],
+    "payments": [{"method": "card", "amount": 1368}],
     "vat_breakdown": [{"rate_bp": 1900, "net": 700, "tax": 133}, {"rate_bp": 700, "net": 500, "tax": 35}]
   }
 }`
@@ -325,7 +327,7 @@ func TestFiscalSignAsk_ApprovedCarriesEvidence(t *testing.T) {
 	// bearing assertion: gross per VAT bucket (net+tax) and tip included
 	// in the payment total.
 	body := h.calls[2].Body()
-	for _, want := range []string{`"amount":"8.33"`, `"amount":"5.35"`, `"amount":"12.90"`, `"vat_rate":"NORMAL"`, `"vat_rate":"REDUCED_1"`, `"payment_type":"NON_CASH"`} {
+	for _, want := range []string{`"amount":"8.33"`, `"amount":"5.35"`, `"amount":"13.68"`, `"vat_rate":"NORMAL"`, `"vat_rate":"REDUCED_1"`, `"payment_type":"NON_CASH"`} {
 		if !strings.Contains(strings.ReplaceAll(body, " ", ""), strings.ReplaceAll(want, " ", "")) {
 			t.Errorf("finish body missing %s\nbody: %s", want, body)
 		}
@@ -402,4 +404,69 @@ func statusOf(t *testing.T, out string, h *stubHost) string {
 		t.Fatalf("stdout not JSON: %v\nstdout: %q\nlogs: %v", err, out, h.logs)
 	}
 	return got.Status
+}
+
+// A tipped sale is exactly the case the independent review caught: the tip
+// rides the payment side and lands in no VAT bucket, so the DSFinV-K
+// Beleg's two halves disagree. Until an accountant rules on the correct
+// representation (ut-docs#833) the plugin must refuse to sign rather than
+// write an irreversible TSE record that misstates the sale.
+func TestFiscalSignAsk_RefusesToSignAnUnbalancedReceipt(t *testing.T) {
+	wasm := buildWasm(t)
+	const tipped = `{
+	  "type": "fiscal.sign.ask",
+	  "payload": {
+	    "sale_id": "sale-tip",
+	    "currency": "EUR",
+	    "total": 1190,
+	    "payments": [{"method": "card", "amount": 1190, "tip_amount": 100}],
+	    "vat_breakdown": [{"rate_bp": 1900, "net": 1000, "tax": 190}]
+	  }
+	}`
+	out, h := run(t, wasm, configuredHost(scriptedFiskaly(t)), tipped)
+	if s := statusOf(t, out, h); s != "unreachable" {
+		t.Errorf("status = %q, want unreachable for an unbalanced receipt", s)
+	}
+	if len(h.calls) != 0 {
+		t.Errorf("contacted fiskaly %d times for a receipt it should have refused outright", len(h.calls))
+	}
+}
+
+// The evidence core renders on a §6 receipt must be complete and correctly
+// formatted — a raw Unix epoch would print as "TSE transaction end:
+// 1755253862" to a customer and a tax auditor.
+func TestFiscalSignAsk_EvidenceIsCompleteAndRFC3339(t *testing.T) {
+	wasm := buildWasm(t)
+	out, h := run(t, wasm, configuredHost(scriptedFiskaly(t)), signAskEvent)
+	var got struct {
+		TSE *struct {
+			TransactionNumber  int64  `json:"transaction_number"`
+			SignatureCounter   int64  `json:"signature_counter"`
+			SerialNumber       string `json:"serial_number"`
+			StartTime          string `json:"start_time"`
+			LogTime            string `json:"log_time"`
+			Signature          string `json:"signature"`
+			SignatureAlgorithm string `json:"signature_algorithm"`
+		} `json:"tse"`
+	}
+	if err := json.Unmarshal([]byte(strings.TrimSpace(out)), &got); err != nil {
+		t.Fatalf("stdout: %v (%q) logs=%v", err, out, h.logs)
+	}
+	if got.TSE == nil {
+		t.Fatal("no evidence on the approved response")
+	}
+	if got.TSE.TransactionNumber != 4711 || got.TSE.SignatureCounter != 12345 {
+		t.Errorf("transaction_number/signature_counter = %d/%d, want 4711/12345", got.TSE.TransactionNumber, got.TSE.SignatureCounter)
+	}
+	if got.TSE.SerialNumber != "TSS-SERIAL-9d5e" {
+		t.Errorf("serial_number = %q", got.TSE.SerialNumber)
+	}
+	if got.TSE.SignatureAlgorithm != "ecdsa-plain-SHA256" {
+		t.Errorf("signature_algorithm = %q", got.TSE.SignatureAlgorithm)
+	}
+	for name, v := range map[string]string{"log_time": got.TSE.LogTime, "start_time": got.TSE.StartTime} {
+		if !strings.Contains(v, "T") || !strings.HasSuffix(v, "Z") {
+			t.Errorf("%s = %q — must be RFC3339, never a raw epoch", name, v)
+		}
+	}
 }

@@ -27,7 +27,7 @@ vs. "researched, not tested":
 | DSFinV-K export format/content is legally compliant | **Not verified, at all.** No DSFinV-K output from this plugin has been checked against the DSFinV-K spec or a real tax audit. |
 | KassenSichV compliance overall | **Not certified.** This is a starting skeleton. A merchant must get real legal/tax-advisor sign-off before relying on this for a live business — this plugin existing does not make a till KassenSichV-compliant. |
 | `go build ./...` / `scripts/build.sh` | **Confirmed** — builds clean as of this commit (see CI). |
-| End-to-end behavior against the till's real event bus | **Partially verified, and now covered by a committed test suite** (`src/wasmrun`, 2026-08-19). The `fiscal.sign.ask` path is exercised against the REAL compiled `plugin.wasm` in a real wazero runtime (same engine `universal-till` uses) with stubbed host functions: event dispatch, settings lookup, the auth→start(`tx_revision=1`)→finish(`tx_revision=2`) call order, the exact money in the signed body, and the exact stdout JSON for the approved path plus three failure paths (fiskaly 5xx, unconfigured, malformed payload). The earlier `tax.rate.ask` wazero run was ad-hoc and uncommitted; this one is a real test that fails if the hook is removed (verified by deliberately deleting the dispatch). Still NOT proven: `universal-till`'s actual host-function implementations, a real installed-plugin flow through the till UI, and the HTTP layer here is a stub rather than live fiskaly (that contract was verified separately, see the SIGN DE row). |
+| End-to-end behavior against the till's real event bus | **Partially verified, and now covered by a committed test suite** (`src/wasmrun`, 2026-08-19). The `fiscal.sign.ask` path is exercised against the REAL compiled `plugin.wasm` in a real wazero runtime (same engine `universal-till` uses) with stubbed host functions: event dispatch, settings lookup, the auth→start(`tx_revision=1`)→finish(`tx_revision=2`) call order, the exact money in the signed body, the full §6 evidence (RFC3339 timestamps, not raw epochs), and the exact stdout JSON for the approved path plus four failure paths (fiskaly 5xx, unconfigured, malformed payload, unbalanced receipt). Proven to bite: deleting the dispatch, dropping `tax` from the VAT gross, or answering `approved` without a signature each fail it. Still NOT proven: `universal-till`'s actual host-function implementations, a real installed-plugin flow through the till UI, and the HTTP layer here is a stub rather than live fiskaly — the two halves are each verified, their combination is not. |
 | DATEV EXTF file structure (31-field header row 1, 125-column header row 2, semicolon-delimited, Windows-1252, CRLF) | **Confirmed against a real reference file** (github.com/ledermann/datev's `EXTF_Buchungsstapel.csv`, byte-verified 2026-08-01), not reconstructed from memory — see `src/datev/datev.go`'s package doc comment. An independent review caught an early draft undercounting header row 1's trailing fields (27 vs. the real 31); fixed and pinned by `TestHeader1_FieldCount`. Unit-tested (`go test ./src/datev/...`), including a Windows-1252 round-trip check on the umlaut/en-dash header text. |
 | DATEV format-version numbers (`700`/`21`/`13`) and Soll/Haben booking convention (Kasse debited, Erlöskonto credited via an Automatikkonto, no BU-Schlüssel by default) | **Researched, not confirmed against DATEV's current published spec** (developer.datev.de 403'd when fetched) or a real accountant/DATEV import. Matches the reference file and common SKR03/04 practice, but NEEDS ACCOUNTANT VERIFICATION before a real filing. |
 | DATEV chart-of-accounts mapping (which Konto/Gegenkonto number per tax rate) | **Never guessed.** No default real account numbers anywhere in this plugin — `datev_konto_kasse`/`datev_erloeskonten` are merchant/accountant-configured settings; the export refuses (with a clear error) rather than emit an unconfigured or invented account number. |
@@ -110,11 +110,11 @@ needed, ADR-0002's `tax`/`export` types already exist):
    closings already exist, not a real export of this till's sales. That
    aggregation step is real, non-trivial work, left undone here.
 
-4. **VAT-rate and payment-type bucketing is best-effort.** `vatRateBucket`
+4. **VAT-rate and payment-type bucketing is best-effort.** `fiscalsign.VATRateBucket`
    maps 19%/7% basis-point rates to fiskaly's `NORMAL`/`REDUCED_1` schema
    enum; anything else falls back to `SPECIAL_RATE_1` rather than guessing
    further (fiskaly's enum also has `REDUCED_2`/`NULL`/`SPECIAL_RATE_2-5`).
-   `paymentTypeBucket` only distinguishes `CASH` vs. `NON_CASH` (case-
+   `fiscalsign.PaymentTypeBucket` only distinguishes `CASH` vs. `NON_CASH` (case-
    insensitive match on `"cash"`) — good enough for the schema's
    granularity, but not exhaustively tested against every payment method
    string the till can produce.
@@ -154,8 +154,11 @@ needed, ADR-0002's `tax`/`export` types already exist):
   a `standard_v1` receipt schema from the sale's real line items/payments.
 - `exportDSFinVK` — `POST {dsfinvk_base}/export` with a business-date range
   and format.
-- Failure handling — never returns a fabricated signature; logs loudly and
-  queues for retry (see `unsigned_queue` in plugin storage).
+- Failure handling — never returns a fabricated signature, and never signs
+  a receipt whose VAT side and payment side disagree. On either, it answers
+  `unreachable` and core applies proceed-and-declare (journal marker,
+  receipt outage notice, operator alert, background re-ask). The plugin's
+  own `unsigned_queue` was removed in v0.4.0 — core owns retry now.
 
 **Confirmed 2026-08-18 (SIGN DE only — see the status table above for exactly
 what this does and doesn't prove):**
@@ -214,18 +217,37 @@ fiskaly call will fail with a permission denial until that happens. Low
 impact today (no real installs of this plugin exist yet), but real for
 whoever installs 0.3.2 over an existing 0.3.x.
 
-**Not the till's real TSE signer yet.** This plugin's `sale.completed` hook
-now genuinely reaches fiskaly and gets a real signature — but
-`universal-till` core's actual TSE-signing integration point is a
-different, newer hook, `fiscal.sign.ask` (blocking, exclusive between
+**This IS the till's real TSE signer, since v0.4.0 (2026-08-19,
+ut-docs#818).** The plugin declares **`fiscal.sign.ask`** — `universal-till`
+core's actual TSE-signing integration point (blocking, exclusive between
 signer plugins, persists evidence, renders it on the receipt, gates
 ADR-0048's system-of-record check — see
-`ut-docs/reference/contracts/fiscal-sign-ask.md`). This plugin does not
-subscribe to it. Concretely: core currently sees **zero fiscal signers
-installed** regardless of this fix — the till's receipts and compliance
-gate are entirely unaware this plugin's fiskaly connection works. Wiring
-`ut-plugin-tax-de` to `fiscal.sign.ask` is real, separate, higher-priority
-follow-up work, not done here.
+`ut-docs/reference/contracts/fiscal-sign-ask.md`) — so core now sees a
+fiscal signer installed. Before this it declared only `sale.completed`, and
+core saw **zero fiscal signers** however well the fiskaly call itself
+worked.
+
+`sale.completed` has been **removed**, along with this plugin's own
+`unsigned_queue`. Core owns the entire failure surface properly now
+(journal marker, receipt outage notice, operator alert, background re-ask
+with `retry: true`), so a second private retry loop was redundant — and an
+independent review proved it was actively harmful: with both hooks live,
+every *successfully signed* sale was immediately re-signed against the same
+`tx_id`, which fiskaly rejects because that transaction is already
+`FINISHED`. Each such sale then got a false "fiskaly was NOT reached" log,
+had its `tse_result:*` audit record overwritten from signed to failed, and
+added a permanent queue entry.
+
+**Two sales that will NOT sign today, deliberately.** A sale carrying a
+**tip**, or a **sale-level discount / service charge**, produces a receipt
+whose two halves disagree (fiskaly renders `standard_v1` into DSFinV-K's
+`Beleg^<gross per VAT rate>^<per payment type>`, and those must be equal —
+a tip has no VAT bucket, and a whole-bill discount moves the total but not
+the per-line breakdown). The plugin refuses to sign such a receipt and
+answers `unreachable`, so the sale completes, is marked unsigned, prints
+the outage notice and is retried — rather than writing an **irreversible**
+TSE record that misstates the sale. The correct German representation is an
+open question with an accountant: **ut-docs#833**.
 
 **`handleTaxRateAsk` (dine-in/takeaway VAT switching) is real, and is the
 one piece of this plugin actually verified against a real wazero-compiled
@@ -292,17 +314,10 @@ about it needed a sandbox account.
    — **done for TSE signing** (2026-08-19, ut-docs#818): `src/wasmrun` is a
    committed wazero suite over the real compiled wasm. **Still open for
    DSFinV-K**, which remains entirely unexercised.
-6. **Send the full §6 TSE evidence, not just signature + log time.** The
-   `fiscal.sign.ask` response carries only the two fields whose paths were
-   actually verified against a real fiskaly response. `transaction_number`,
-   `signature_counter`, `serial_number`, `start_time` and
-   `signature_algorithm` are omitted on purpose rather than guessed —
-   fiskaly's own Postman collection documents those on the TSS and client
-   resources, not on the transaction finish response. The contract makes
-   every field optional and keys presence on `signature`, so partial
-   evidence is valid; but a German receipt is supposed to show them, and a
-   wrong value there would be worse than an absent one. Needs one live
-   sandbox call to read the real finish-response shape.
+6. **Get an accountant's ruling on tips and whole-bill discounts**
+   (**ut-docs#833**) and then represent them on the signed receipt. Until
+   that lands, those sales deliberately do not sign — see above. This is
+   the single biggest functional gap in TSE signing today.
 7. **Verify the remaining VAT buckets against the sandbox.** Only `NORMAL`
    has been exercised live; `REDUCED_1` / `NULL` / `SPECIAL_RATE_1` are
    unit-tested for mapping but never round-tripped through fiskaly.

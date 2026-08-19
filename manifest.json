@@ -121,10 +121,6 @@
       "action": "fiscal.sign"
     },
     {
-      "event": "sale.completed",
-      "action": "tse.sign"
-    },
-    {
       "event": "tax.rate.ask",
       "action": "tax.rate"
     },
