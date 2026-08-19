@@ -25,15 +25,25 @@
 //     as possibly a genuinely separate API/host from SIGN DE (cash_register/
 //     cashPointClosing concepts), not just a different path on the same
 //     host. Do not assume fiskalyparse.DsfinvkBase is even structurally right.
-//   - NOT the till's real TSE signer: universal-till core's actual
-//     TSE-signing extension point is a different, newer hook, fiscal.sign.ask
-//     (blocking, exclusive between signer plugins, persists evidence, gates
-//     ADR-0048 — see ut-docs/reference/contracts/fiscal-sign-ask.md). This
-//     plugin only declares sale.completed and does NOT subscribe to
-//     fiscal.sign.ask, so core currently sees ZERO fiscal signers installed
-//     regardless of the 2026-08-18 SIGN DE fix below — this plugin's fiskaly
-//     connection now genuinely works, but it's disconnected from the till's
-//     receipts and compliance gate. Real, separate follow-up work.
+//   - IS the till's real TSE signer since 2026-08-19 (ut-docs#818). This
+//     plugin now declares fiscal.sign.ask — core's actual TSE-signing
+//     extension point (blocking, exclusive between signer plugins, persists
+//     evidence, gates ADR-0048; see
+//     ut-docs/reference/contracts/fiscal-sign-ask.md) — so core sees a
+//     fiscal signer installed. It previously declared only sale.completed,
+//     which meant core saw ZERO signers however well the fiskaly call
+//     itself worked. sale.completed has been REMOVED: core now owns the
+//     whole failure surface (journal marker, receipt notice, operator
+//     alert, background re-ask), so this plugin's own private retry queue
+//     was both redundant and actively corrupting its audit records.
+//   - REFUSES to sign an unbalanced receipt. fiskaly renders standard_v1
+//     into DSFinV-K's Beleg^<per VAT rate>^<per payment type>, whose halves
+//     must be equal. A tip rides the payment side with no VAT bucket, and a
+//     sale-level discount/service charge moves the total without moving the
+//     per-line vat_breakdown — so those sales currently do NOT sign, by
+//     design, and take core's declared-and-retried path instead. The
+//     correct German tax representation is an open accountant question,
+//     ut-docs#833. Do not "fix" this by picking a bucket and signing.
 //   - DSFinV-K export format/content compliance has NOT been legally
 //     verified against KassenSichV. Cash-point-closing generation (the
 //     aggregation step DSFinV-K exports actually depend on) is NOT
@@ -43,24 +53,26 @@
 //     tax-advisor sign-off is required before any merchant relies on this
 //     plugin for a live business. See README.md.
 //
-// OFFLINE-FIRST TENSION (ADR-0025's flagged-but-unresolved open question):
-// `sale.completed` is dispatched NON-BLOCKING and fires AFTER the sale has
-// already completed (confirmed against universal-till's
-// internal/plugins/ipc.go / wasm_runtime.go: non-blocking events are
-// enqueued to a drainer goroutine whose result is discarded — a plugin
-// error here is logged, never retried, never surfaced to the till operator
-// or any UI). Concretely: this plugin has NO architectural way to block or
-// reverse a sale if fiskaly is unreachable — by the time it runs, the till
-// has already completed the sale per ADR-0003 (offline-first, non-
-// negotiable). What it CAN do, and does: never fabricate a signature. A
-// failed sign attempt is logged loudly and the sale is recorded as
-// "unsigned, pending retry" in plugin storage (queued the same way
-// ut-plugin-integration-webhook queues undelivered sales) instead of being
-// silently marked as compliant. Whether an unsigned-then-backfilled sale
-// satisfies KassenSichV's "irreversible, tamper-proof at time of
-// transaction" requirement is exactly the question ADR-0025 flags as
-// needing real TSE-vendor/legal confirmation — NOT decided or resolved by
-// this code.
+// OFFLINE-FIRST TENSION — RESOLVED 2026-08-19 (ut-docs#818). This block
+// previously described `sale.completed`'s dead end: dispatched
+// NON-BLOCKING and fired AFTER the sale, so this plugin had no
+// architectural way to block, reverse or even declare a sale when fiskaly
+// was unreachable, and worked around it with a private "unsigned, pending
+// retry" queue. That hook and that queue are GONE.
+//
+// The plugin now answers `fiscal.sign.ask`: blocking, tender-phase, 3000ms
+// budget, `proceed-and-declare`. Core owns the whole failure surface —
+// audit-journal marker, receipt outage notice, operator alert, background
+// re-ask — so a failure is declared and visible, never silent, and the sale
+// still never blocks on connectivity (ADR-0003 intact).
+//
+// What ADR-0025 flagged and did NOT resolve is still not resolved here:
+// whether an unsigned-then-backfilled sale satisfies KassenSichV's
+// "irreversible, tamper-proof at time of transaction" requirement is a
+// legal/TSE-vendor question, not something this code decides.
+//
+// Two hard rules survive: never fabricate a signature, and never sign a
+// receipt already known to misstate the sale (see fiscalsign.BalanceDelta).
 package main
 
 import (
@@ -74,6 +86,7 @@ import (
 	"unsafe"
 
 	"github.com/universaltill/ut-plugin-tax-de/src/datev"
+	"github.com/universaltill/ut-plugin-tax-de/src/fiscalsign"
 	"github.com/universaltill/ut-plugin-tax-de/src/fiskalyparse"
 )
 
@@ -119,9 +132,7 @@ const dsfinvkExportEntryKey = "dsfinvk-export-de"
 const datevExportEntryKey = "datev-buchungsstapel-export-de"
 
 const (
-	unsignedQueueKey = "unsigned_queue" // storage key: sales that failed to sign, pending retry
-	maxQueue         = 200              // bounded, oldest dropped past this (mirrors ut-plugin-integration-webhook)
-	tokenStorageKey  = "fiskaly_token"  // cached {access_token, obtained_at}
+	tokenStorageKey = "fiskaly_token" // cached {access_token, obtained_at}
 )
 
 func ptrOf(b []byte) (uint32, uint32) {
@@ -284,77 +295,13 @@ func authHeader(token string) map[string]string {
 	}
 }
 
-// --- till event contract (mirrors internal/plugins/ipc.go's SaleCompletedEvent) ---
-
-type saleLineItem struct {
-	Quantity       float64 `json:"quantity"`
-	UnitPriceCents int64   `json:"unit_price_cents"`
-	TaxRateBP      int     `json:"tax_rate_bp"`
-	TotalCents     int64   `json:"total_cents"`
-}
-
-type salePayment struct {
-	Method      string `json:"method"`
-	AmountCents int64  `json:"amount_cents"`
-}
-
-type saleCompletedEvent struct {
-	SaleID      string         `json:"sale_id"`
-	ReceiptNo   string         `json:"receipt_no"`
-	SaleType    string         `json:"sale_type"`
-	Currency    string         `json:"currency"`
-	TotalCents  int64          `json:"total_cents"`
-	Payments    []salePayment  `json:"payments"`
-	LineItems   []saleLineItem `json:"line_items"`
-	CompletedAt time.Time      `json:"completed_at"`
-}
-
 // --- TSE signing (SIGN DE API) ---
 
-// vatRateBucket maps a basis-point VAT rate to fiskaly's SIGN DE
-// `standard_v1` schema vat_rate enum. Germany's rates today: 19% (NORMAL),
-// 7% (REDUCED_1). Anything else falls back to SPECIAL_RATE_1 rather than
-// guessing further — fiskaly's enum also has REDUCED_2/NULL/SPECIAL_RATE_2-5
-// for cases (e.g. 0%) this skeleton doesn't attempt to classify.
-//
-// CONFIRMED 2026-08-18: the standard_v1 schema shape (amounts_per_vat_rate /
-// amounts_per_payment_type field names, sent with vat_rate="NORMAL" and
-// payment_type="NON_CASH") was accepted by a live fiskaly sandbox and echoed
-// back correctly in the signed transaction. NEEDS SANDBOX VERIFICATION
-// still: the REDUCED_1/NULL/SPECIAL_RATE_1 enum values below were not
-// exercised (only NORMAL was) — no reason to expect they're wrong, just not
-// independently proven the way NORMAL now is.
-func vatRateBucket(bp int) string {
-	switch bp {
-	case 1900:
-		return "NORMAL"
-	case 700:
-		return "REDUCED_1"
-	case 0:
-		return "NULL"
-	default:
-		return "SPECIAL_RATE_1"
-	}
-}
-
-// paymentTypeBucket maps the till's free-text payment method to fiskaly's
-// CASH/NON_CASH split (that's the granularity the TSE schema actually
-// cares about — everything that isn't physical cash is NON_CASH).
-func paymentTypeBucket(method string) string {
-	if strings.EqualFold(method, "cash") {
-		return "CASH"
-	}
-	return "NON_CASH"
-}
-
-func minorToDecimalString(cents int64) string {
-	sign := ""
-	if cents < 0 {
-		sign = "-"
-		cents = -cents
-	}
-	return fmt.Sprintf("%s%d.%02d", sign, cents/100, cents%100)
-}
+// The VAT/payment bucket mapping and minor-unit formatting moved to
+// src/fiscalsign (2026-08-19, ut-docs#818) so they are unit-testable on the
+// host -- this file is wasip1-only and cannot be tested directly. They are
+// also the fiskaly-shaped part of the seam ADR-0055 requires, i.e. what a
+// future config-selected second provider would replace.
 
 // txID derives a fiskaly transaction id from the sale id. SIGN DE's
 // /tss/{tss_id}/tx/{tx_id} path segment must be a UUID in fiskaly's docs
@@ -386,6 +333,24 @@ type tseSignResult struct {
 	LogTime       string    `json:"log_time,omitempty"`
 	FailureReason string    `json:"failure_reason,omitempty"`
 	AttemptedAt   time.Time `json:"attempted_at"`
+
+	// Evidence is the full §6 receipt evidence from the FINISHED
+	// transaction. Not persisted in the audit record (the flat fields
+	// above already cover that); carried so the fiscal.sign.ask answer can
+	// hand it to core for the receipt.
+	Evidence fiskalyparse.SignEvidence `json:"-"`
+}
+
+// signInput is the provider-neutral view of a sale to be signed: already
+// bucketed, already deterministically ordered, with nothing fiskaly-shaped
+// left to decide. Keeping signTransaction off the raw event struct is the
+// provider seam ADR-0055 requires — a second backend would replace the
+// mapping in src/fiscalsign that produces this, not this function.
+type signInput struct {
+	SaleID   string
+	SaleType string
+	VAT      []fiscalsign.VATAmount
+	Payments []fiscalsign.PaymentAmount
 }
 
 // signTransaction attempts one real TSE-sign round-trip against fiskaly's
@@ -408,7 +373,7 @@ type tseSignResult struct {
 // specific count of them before FINISHED) but was not itself run against
 // live fiskaly — worth confirming if a real sign attempt ever fails at the
 // finish step specifically.
-func signTransaction(sale saleCompletedEvent, apiKey, apiSecret, tssID, clientID string) tseSignResult {
+func signTransaction(sale signInput, apiKey, apiSecret, tssID, clientID string) tseSignResult {
 	result := tseSignResult{SaleID: sale.SaleID, AttemptedAt: time.Now().UTC()}
 
 	if tssID == "" || clientID == "" {
@@ -436,24 +401,13 @@ func signTransaction(sale saleCompletedEvent, apiKey, apiSecret, tssID, clientID
 		return result
 	}
 
-	// 2. Finish the transaction with the receipt schema (vat-rate and
-	//    payment-type breakdown built from the real sale line items/payments).
-	vatBuckets := map[string]int64{}
-	for _, li := range sale.LineItems {
-		vatBuckets[vatRateBucket(li.TaxRateBP)] += li.TotalCents
-	}
-	payBuckets := map[string]int64{}
-	for _, p := range sale.Payments {
-		payBuckets[paymentTypeBucket(p.Method)] += p.AmountCents
-	}
-	amountsPerVAT := make([]map[string]string, 0, len(vatBuckets))
-	for rate, cents := range vatBuckets {
-		amountsPerVAT = append(amountsPerVAT, map[string]string{"vat_rate": rate, "amount": minorToDecimalString(cents)})
-	}
-	amountsPerPayment := make([]map[string]string, 0, len(payBuckets))
-	for typ, cents := range payBuckets {
-		amountsPerPayment = append(amountsPerPayment, map[string]string{"payment_type": typ, "amount": minorToDecimalString(cents)})
-	}
+	// 2. Finish the transaction with the receipt schema. The vat-rate and
+	//    payment-type breakdowns are computed by the caller (src/fiscalsign,
+	//    unit-tested) and arrive already bucketed and deterministically
+	//    ordered, so the same sale always produces the same request body --
+	//    which matters because a background retry re-signs the same sale.
+	amountsPerVAT := sale.VAT
+	amountsPerPayment := sale.Payments
 	receiptType := "RECEIPT"
 	if sale.SaleType == "return" {
 		receiptType = "RECEIPT_0104" // best-effort: fiskaly's return/cancellation receipt type code, NOT confirmed
@@ -485,93 +439,16 @@ func signTransaction(sale saleCompletedEvent, apiKey, apiSecret, tssID, clientID
 	result.Signed = true
 	result.SignatureB64 = sig
 	result.LogTime = logTime
+	// Full evidence for the wire (RFC3339 timestamps); the flat fields
+	// above keep their existing shape so `tse_result:*` records already
+	// written stay comparable.
+	result.Evidence = fiskalyparse.ParseSignEvidence(body)
 	return result
 }
 
 // parseSignResponse moved to fiskalyparse.ParseSignResponse (2026-08-18 code
 // review) — see that function's doc comment for why signature and
 // log-timestamp extraction are deliberately independent.
-
-// --- unsigned-sale retry queue (mirrors ut-plugin-integration-webhook's delivery queue) ---
-
-func loadUnsignedQueue() []json.RawMessage {
-	raw, ok := storageRead(unsignedQueueKey)
-	if !ok || len(raw) == 0 {
-		return nil
-	}
-	var q []json.RawMessage
-	if err := json.Unmarshal(raw, &q); err != nil {
-		return nil
-	}
-	return q
-}
-
-func saveUnsignedQueue(q []json.RawMessage) {
-	if len(q) > maxQueue {
-		q = q[len(q)-maxQueue:]
-	}
-	storagePut(unsignedQueueKey, mustJSON(q))
-}
-
-// handleSaleCompleted is the `sale.completed` hook body. It NEVER blocks or
-// reverses the sale (impossible from this seam, see package doc comment) —
-// its only job is: attempt a real sign, and if that fails, fail loudly
-// (log + queue) rather than pretend success.
-func handleSaleCompleted(raw []byte) {
-	apiKey := strings.TrimSpace(setting("fiskaly_api_key"))
-	apiSecret := strings.TrimSpace(setting("fiskaly_api_secret"))
-	tssID := strings.TrimSpace(setting("fiskaly_tss_id"))
-	clientID := strings.TrimSpace(setting("fiskaly_client_id"))
-
-	if apiKey == "" || apiSecret == "" {
-		logf("tax-de: not configured (fiskaly_api_key/fiskaly_api_secret empty) — sale NOT signed, skipping")
-		os.Exit(0)
-	}
-
-	// 1. Retry previously-unsigned sales first (same pattern as the webhook
-	//    plugin's queue flush).
-	var stillUnsigned []json.RawMessage
-	for _, p := range loadUnsignedQueue() {
-		var s saleCompletedEvent
-		if err := json.Unmarshal(p, &s); err != nil {
-			continue
-		}
-		res := signTransaction(s, apiKey, apiSecret, tssID, clientID)
-		recordResult(res)
-		if !res.Signed {
-			stillUnsigned = append(stillUnsigned, p)
-		} else {
-			logf("tax-de: retry signed previously-unsigned sale %s", s.SaleID)
-		}
-	}
-
-	// 2. Handle the current sale.
-	var ev struct {
-		Payload json.RawMessage `json:"payload"`
-	}
-	_ = json.Unmarshal(raw, &ev)
-	var sale saleCompletedEvent
-	if len(ev.Payload) > 0 {
-		_ = json.Unmarshal(ev.Payload, &sale)
-	}
-	if sale.SaleID != "" {
-		res := signTransaction(sale, apiKey, apiSecret, tssID, clientID)
-		recordResult(res)
-		if res.Signed {
-			logf("tax-de: SIGNED sale %s tx=%s", sale.SaleID, res.TxID)
-		} else {
-			logf("tax-de: UNSIGNED sale %s (%s) — queued for retry, fiskaly was NOT reached successfully", sale.SaleID, res.FailureReason)
-			stillUnsigned = append(stillUnsigned, ev.Payload)
-		}
-	}
-
-	saveUnsignedQueue(stillUnsigned)
-
-	// Non-blocking hook contract (same as ut-plugin-integration-webhook):
-	// this exit code cannot affect a sale that has already completed. It is
-	// NOT a signal of "signed successfully" — that is recordResult's job.
-	os.Exit(0)
-}
 
 // taxRateAskPayload mirrors universal-till's internal/pages/tax_hook.go —
 // the till's core has NO built-in notion of §12 UStG's dine-in/takeaway
@@ -581,6 +458,113 @@ type taxRateAskPayload struct {
 	TaxCodeID string `json:"tax_code_id"`
 	TaxRateBP int    `json:"tax_rate_bp"`
 	OrderType string `json:"order_type"`
+}
+
+// NOTE: the old `sale.completed` handler and this plugin's own
+// `unsigned_queue` retry loop were REMOVED in ut-docs#818 (2026-08-19).
+//
+// They existed only because `sale.completed` is non-blocking and fires
+// AFTER the sale — the plugin had no way to declare a signing failure, so
+// it queued and retried privately. Now that the plugin answers the real
+// `fiscal.sign.ask` point, core owns that entire surface properly:
+// journal marker, receipt outage notice, operator alert, and background
+// re-ask with `retry: true`. A second, private retry loop is redundant.
+//
+// It was also actively harmful. An independent review (2026-08-19) proved
+// that with both hooks live, every SUCCESSFULLY signed sale was then
+// re-signed by `sale.completed` against the same deterministic `tx_id` —
+// which fiskaly rejects, because that transaction is already FINISHED. The
+// result per sale: a false "fiskaly was NOT reached" operator log, the
+// `tse_result:<sale_id>` audit record overwritten from signed to FAILED,
+// and one permanent entry added to a queue that grows to 200 and then
+// costs 200 failing round-trips on every subsequent sale.
+
+// handleFiscalSignAsk answers core's real TSE-signing extension point
+// (ut-docs#818; contract fiscal-sign-ask.md v1.1.0, registered by ADR-0044
+// Decision 1). This -- not sale.completed -- is what makes core see a
+// fiscal signer as installed at all.
+//
+// Failure policy is core's, not ours: on any failure we answer
+// "unreachable" and core applies proceed-and-declare (sale completes,
+// journaled unsigned, receipt notice, operator alert, background retry).
+// We never block the sale and never fabricate a signature.
+func handleFiscalSignAsk(raw []byte) {
+	req, err := fiscalsign.ParseRequest(raw)
+	if err != nil {
+		// Fail closed: an unreadable request means signing is unproven.
+		logf("tax-de: fiscal.sign.ask: %v -- answering unreachable", err)
+		fmt.Print(string(fiscalsign.Unreachable().JSON()))
+		os.Exit(0)
+	}
+
+	apiKey := strings.TrimSpace(setting("fiskaly_api_key"))
+	apiSecret := strings.TrimSpace(setting("fiskaly_api_secret"))
+	tssID := strings.TrimSpace(setting("fiskaly_tss_id"))
+	clientID := strings.TrimSpace(setting("fiskaly_client_id"))
+
+	if apiKey == "" || apiSecret == "" || tssID == "" || clientID == "" {
+		// Not configured is NOT "not-this-terminal": that status means "no
+		// opinion" and would let the sale pass with no marker at all. A
+		// German till with an unconfigured signer must still surface the
+		// gap, so declare it unreachable and let core declare + retry.
+		logf("tax-de: fiscal.sign.ask: fiskaly settings incomplete -- answering unreachable")
+		fmt.Print(string(fiscalsign.Unreachable().JSON()))
+		os.Exit(0)
+	}
+
+	// Refuse to sign a receipt whose own two halves disagree.
+	//
+	// fiskaly renders standard_v1 into DSFinV-K's `Beleg^<per VAT
+	// rate>^<per payment type>`, and those halves must be equal. Core can
+	// legitimately hand us an unbalanced request — a tip rides the payment
+	// side with no VAT bucket, and a sale-level discount/service charge
+	// moves `total` without moving the per-line `vat_breakdown`. How those
+	// SHOULD be represented is a German tax question, asked of a real
+	// accountant in ut-docs#833, not something to guess here.
+	//
+	// A TSE signature cannot be corrected afterwards, so signing a receipt
+	// we already know misstates the sale is worse than declaring a gap:
+	// core's proceed-and-declare path completes the sale, marks it
+	// unsigned, prints the outage notice, alerts the operator and retries.
+	// Same principle as never fabricating a signature.
+	if delta := fiscalsign.BalanceDelta(req); delta != 0 {
+		logf("tax-de: fiscal.sign.ask: REFUSING to sign sale %s — VAT side and payment side differ by %d minor units (tip / sale-level discount / service charge; see ut-docs#833). Answering unreachable.", req.SaleID, delta)
+		fmt.Print(string(fiscalsign.Unreachable().JSON()))
+		os.Exit(0)
+	}
+
+	in := signInput{
+		SaleID:   req.SaleID,
+		VAT:      fiscalsign.VATAmounts(req),
+		Payments: fiscalsign.PaymentAmounts(req),
+	}
+	res := signTransaction(in, apiKey, apiSecret, tssID, clientID)
+	recordResult(res)
+
+	if !res.Signed {
+		logf("tax-de: fiscal.sign.ask: sale %s NOT signed (%s) -- answering unreachable", req.SaleID, res.FailureReason)
+		fmt.Print(string(fiscalsign.Unreachable().JSON()))
+		os.Exit(0)
+	}
+
+	// Full §6 KassenSichV evidence. Every field path below is read from a
+	// REAL fiskaly response captured from the live sandbox on 2026-08-18
+	// (fiskalyparse's realFinishedTransactionBody fixture) — not guessed,
+	// and not from documentation. An earlier draft of this handler sent
+	// only signature+log_time, claiming the other paths were unknown; an
+	// independent review found that was simply wrong, and that this repo's
+	// own committed fixture already contained all of them.
+	ev := res.Evidence
+	fmt.Print(string(fiscalsign.Approved(fiscalsign.TSEEvidence{
+		TransactionNumber:  ev.TransactionNumber,
+		SignatureCounter:   ev.SignatureCounter,
+		SerialNumber:       ev.SerialNumber,
+		StartTime:          ev.StartTime,
+		LogTime:            ev.LogTime,
+		Signature:          ev.Signature,
+		SignatureAlgorithm: ev.SignatureAlgorithm,
+	}).JSON()))
+	os.Exit(0)
 }
 
 // handleTaxRateAsk answers the "tax.rate.ask" hook (EventBus.Ask — a
@@ -629,8 +613,9 @@ func handleTaxRateAsk(raw []byte) {
 
 // recordResult persists the sign attempt's outcome (signed or not) keyed by
 // sale id, so a future report/reconciliation surface can enumerate unsigned
-// sales. Deliberately separate from the retry queue: this is a permanent
-// audit record, the queue is transient retry state.
+// sales. A permanent audit record. (It used to be contrasted with this
+// plugin's own transient retry queue; that queue was removed in v0.4.0 —
+// core owns retry now.)
 func recordResult(res tseSignResult) {
 	storagePut("tse_result:"+res.SaleID, mustJSON(res))
 }
@@ -790,8 +775,8 @@ func main() {
 	_ = json.Unmarshal(raw, &ev)
 
 	switch {
-	case ev.Type == "sale.completed":
-		handleSaleCompleted(raw)
+	case ev.Type == "fiscal.sign.ask":
+		handleFiscalSignAsk(raw)
 
 	case ev.Type == "tax.rate.ask":
 		handleTaxRateAsk(raw)

@@ -11,6 +11,7 @@ package fiskalyparse
 import (
 	"encoding/json"
 	"strconv"
+	"time"
 )
 
 // SignDEBase is fiskaly's Cloud-TSE ("SIGN DE") API, the KassenSichV
@@ -117,4 +118,94 @@ func formatTimestamp(raw json.RawMessage) string {
 	// rather than silently dropping it. Better a slightly unformatted value
 	// than an empty one for an audit-trail field.
 	return string(raw)
+}
+
+// SignEvidence is the full §6 KassenSichV receipt evidence carried on a
+// FINISHED transaction response.
+//
+// Separate from ParseSignResponse deliberately. That function predates this
+// one, returns the log timestamp as fiskaly's raw unixTime, and feeds this
+// plugin's internal `tse_result:*` audit records — changing its output would
+// change records already written. This one is the WIRE view, used to answer
+// core's fiscal.sign.ask, where the contract requires RFC3339
+// (ut-docs/reference/contracts/fiscal-sign-ask.md v1.1.0).
+type SignEvidence struct {
+	TransactionNumber  int64
+	SignatureCounter   int64
+	SerialNumber       string
+	StartTime          string // RFC3339
+	LogTime            string // RFC3339
+	Signature          string
+	SignatureAlgorithm string
+}
+
+// ParseSignEvidence extracts every evidence field a §6 receipt needs from a
+// FINISHED transaction body.
+//
+// Field paths are taken from a REAL sandbox response captured 2026-08-18
+// (see parse_test.go's realFinishedTransactionBody), not from documentation
+// and not guessed:
+//
+//	number                → TransactionNumber
+//	tss_serial_number     → SerialNumber   (on the transaction, not only the TSS)
+//	time_start            → StartTime
+//	log.timestamp         → LogTime
+//	signature.value       → Signature
+//	signature.counter     → SignatureCounter
+//	signature.algorithm   → SignatureAlgorithm
+//
+// Every field is independently optional: an absent one stays zero rather
+// than failing the whole parse, matching the contract's "every tse field is
+// individually optional" rule. A partially-populated evidence object is
+// valid; a fabricated one is not.
+func ParseSignEvidence(body []byte) SignEvidence {
+	var r struct {
+		Number          int64           `json:"number"`
+		TSSSerialNumber string          `json:"tss_serial_number"`
+		TimeStart       json.RawMessage `json:"time_start"`
+		Signature       struct {
+			Value     string `json:"value"`
+			Counter   int64  `json:"counter"`
+			Algorithm string `json:"algorithm"`
+		} `json:"signature"`
+		Log struct {
+			Timestamp json.RawMessage `json:"timestamp"`
+		} `json:"log"`
+	}
+	if err := json.Unmarshal(body, &r); err != nil {
+		return SignEvidence{}
+	}
+	ev := SignEvidence{
+		TransactionNumber:  r.Number,
+		SignatureCounter:   r.Signature.Counter,
+		SerialNumber:       r.TSSSerialNumber,
+		Signature:          r.Signature.Value,
+		SignatureAlgorithm: r.Signature.Algorithm,
+	}
+	if hasTimestampValue(r.Log.Timestamp) {
+		ev.LogTime = timestampRFC3339(r.Log.Timestamp)
+	}
+	if hasTimestampValue(r.TimeStart) {
+		ev.StartTime = timestampRFC3339(r.TimeStart)
+	}
+	return ev
+}
+
+// timestampRFC3339 renders fiskaly's unixTime (or an already-formatted
+// string) as RFC3339 UTC.
+//
+// This matters on a receipt, not just in a struct: core prints the value
+// verbatim ("TSE transaction end: <value>"), so a raw epoch would reach a
+// German customer's receipt and a tax audit as an unreadable integer.
+// fiskaly renders this same value the same way in its own qr_code_data.
+func timestampRFC3339(raw json.RawMessage) string {
+	var n int64
+	if err := json.Unmarshal(raw, &n); err == nil {
+		return time.Unix(n, 0).UTC().Format(time.RFC3339)
+	}
+	var s string
+	if err := json.Unmarshal(raw, &s); err == nil {
+		return s // already a formatted timestamp
+	}
+	return ""
 }
