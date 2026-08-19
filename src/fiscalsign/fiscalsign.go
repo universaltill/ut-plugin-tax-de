@@ -155,20 +155,74 @@ type PaymentAmount struct {
 	Amount      string `json:"amount"`
 }
 
+// taxInclusive infers whether the request's vat_breakdown is expressed
+// tax-INCLUSIVE (net already carries the tax) or tax-EXCLUSIVE (tax sits on
+// top), and whether the breakdown reconciles against the sale total at all.
+//
+// This has to be inferred because **the payload carries no tax_inclusive
+// flag**, yet core fills the same two fields differently depending on it
+// (universal-till's buildFiscalSignPayload + pos.ComputeTaxBasisPoints):
+//
+//	exclusive: net = true net, tax added on top     -> gross = net + tax
+//	inclusive: net = GROSS,    tax contained within -> gross = net
+//
+// Germany prices tax-inclusive, so reading it as exclusive would
+// double-count the tax on essentially every real sale — over-declaring
+// turnover on an irreversible record, and (with the balance check below)
+// refusing to sign anything at all.
+//
+// The inference is not a guess: `total` is authoritative, so whichever
+// reading reconciles with it is the right one. Zero-rated lines satisfy
+// both readings and give the same gross either way. Neither reading
+// reconciling means something else moved the total — a sale-level discount
+// or service charge, which the payload does not break out — and the caller
+// must then refuse to sign rather than pick one.
+//
+// Reported upstream as a contract gap: ut-docs#834.
+func taxInclusive(req Request) (inclusive bool, ok bool) {
+	var sumNet, sumTax int64
+	for _, l := range req.VATBreakdown {
+		sumNet += l.Net
+		sumTax += l.Tax
+	}
+	switch {
+	case sumNet == req.Total:
+		return true, true // net already gross (also the zero-rated case)
+	case sumNet+sumTax == req.Total:
+		return false, true
+	default:
+		return false, false
+	}
+}
+
+// vatGross returns the gross amount per VAT bucket, and whether the
+// breakdown could be reconciled with the sale total at all.
+func vatGross(req Request) (map[string]int64, bool) {
+	inclusive, ok := taxInclusive(req)
+	buckets := map[string]int64{}
+	for _, l := range req.VATBreakdown {
+		gross := l.Net + l.Tax
+		if inclusive {
+			gross = l.Net
+		}
+		buckets[VATRateBucket(l.RateBP)] += gross
+	}
+	return buckets, ok
+}
+
 // VATAmounts builds amounts_per_vat_rate from the request's VAT breakdown.
 //
-// The amount per bucket is GROSS — net + tax. The contract sends the two
-// separately; sending net alone would under-declare the turnover of every
-// signed sale.
+// The amount per bucket is the GROSS for that rate — confirmed against
+// fiskaly's own collection, whose signed DSFinV-K process data reads
+// `Beleg^21.42_0.00_0.00_0.00_0.00^21.42:Unbar` (gross per rate on the
+// left, payments on the right). How the gross is derived depends on the
+// pricing convention; see taxInclusive.
 //
 // Output order is sorted by bucket name so the same sale always produces
 // byte-identical request bodies (Go randomises map iteration, and a
 // background retry re-signs the same sale).
 func VATAmounts(req Request) []VATAmount {
-	buckets := map[string]int64{}
-	for _, l := range req.VATBreakdown {
-		buckets[VATRateBucket(l.RateBP)] += l.Net + l.Tax
-	}
+	buckets, _ := vatGross(req)
 	out := make([]VATAmount, 0, len(buckets))
 	for rate, cents := range buckets {
 		out = append(out, VATAmount{VATRate: rate, Amount: MinorToDecimalString(cents)})
@@ -280,12 +334,25 @@ func NotThisTerminal() Response { return Response{Status: StatusNotThisTerminal}
 // as never fabricating a signature: do not sign a receipt already known to
 // be wrong, because a TSE signature cannot be corrected afterwards.
 func BalanceDelta(req Request) int64 {
-	var vat, paid int64
-	for _, l := range req.VATBreakdown {
-		vat += l.Net + l.Tax
+	buckets, ok := vatGross(req)
+	if !ok {
+		// The breakdown does not reconcile with the sale total under either
+		// pricing convention — a sale-level discount or service charge, which
+		// the payload never breaks out. Unsignable; report a non-zero delta
+		// so the caller refuses.
+		return req.Total - sumPayments(req) - 1
 	}
+	var vat int64
+	for _, cents := range buckets {
+		vat += cents
+	}
+	return vat - sumPayments(req)
+}
+
+func sumPayments(req Request) int64 {
+	var paid int64
 	for _, p := range req.Payments {
 		paid += p.Amount + p.TipAmount
 	}
-	return vat - paid
+	return paid
 }

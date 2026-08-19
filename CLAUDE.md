@@ -58,6 +58,86 @@ round-trips per sale). Core now owns the whole failure surface properly
 `retry: true` — so a private retry loop was redundant as well as harmful.
 **Do not re-add `sale.completed` for signing.**
 
+**The plugin REFUSES to sign a receipt it cannot reconcile**
+(`fiscalsign.BalanceDelta`). fiskaly renders `standard_v1` into DSFinV-K's
+`Beleg^<gross per VAT rate>^<per payment type>`, whose halves must be
+equal. Two cases cannot be reconciled from the payload:
+
+- a **tip** — it rides the payment side and sits in no VAT bucket;
+- a **sale-level discount or service charge** — core moves `total` by it but
+  `vat_breakdown` is per-line and pre-both, and the payload never breaks it
+  out.
+
+Those sales do NOT sign; they take core's declared-and-retried path.
+**This is not a bug to fix by picking a VAT bucket** — the tip treatment is
+an open accountant question (ut-docs#833) and the missing payload fields are
+ut-docs#834. A TSE signature is irreversible, so declaring a gap beats an
+irreversible false record.
+
+**Tax-inclusive vs tax-exclusive is INFERRED, and getting it wrong is
+catastrophic.** The payload has no `tax_inclusive` flag, but core fills
+`vat_breakdown` differently depending on it (`buildFiscalSignPayload` +
+`pos.ComputeTaxBasisPoints`):
+
+| pricing | `net` holds | gross is |
+|---|---|---|
+| exclusive | true net | `net + tax` |
+| **inclusive** (German norm) | **already the gross** | **`net`** |
+
+`fiscalsign.taxInclusive` deduces which by testing that reconciles against
+`total`, which is authoritative — not a guess, and zero-rated lines give the
+same answer either way. An earlier draft of this code assumed exclusive
+unconditionally; combined with the balance check that would have **refused
+to sign every ordinary German sale**, which is worse than the bug it fixed.
+Do not "simplify" this back to `net + tax`.
+
+## Status: SIGN DE's API contract confirmed 2026-08-18; DSFinV-K still a skeleton
+
+SIGN DE (TSE signing) was verified 2026-08-18 against a real fiskaly TEST
+sandbox — see `src/main.go`'s package doc comment and README.md's status
+table for exactly what that proved and what it didn't. Two real bugs were
+found and fixed by that test: `signDEBase` pointed at a dead host
+(`kassensichv.io`, now 404s everywhere — corrected to
+`kassensichv-middleware.fiskaly.com/api/v2`), and `parseSignResponse` read
+the signature from a response shape (`tss_tx_result.signature.value`) that
+doesn't match fiskaly's real payload (`signature.value`, top-level) — that
+second bug alone would have made every real sign attempt silently fail even
+once the host was fixed.
+
+**This IS now the till's real TSE signer (2026-08-19, ut-docs#818).**
+Superseding the previous note here, which said the opposite: `manifest.json`
+now declares **`fiscal.sign.ask`** — core's actual TSE-signing extension
+point (ADR-0041/0044/0048; blocking, exclusive between signer plugins,
+persists evidence, renders it on the receipt, gates the ADR-0048
+system-of-record check — see `ut-docs/reference/contracts/fiscal-sign-ask.md`
+and `universal-till/internal/pages/fiscal_sign_hook.go`). Core therefore
+sees a fiscal signer installed; previously it saw **zero**, so every sale
+took the `fiscalSignNoSigner` path no matter how well the fiskaly call
+worked.
+
+**ADR-0055 decided signing stays in THIS plugin.** ADR-0044 Decision 3 had
+called for splitting signing into a separate `ut-plugin-tax-fiskaly` repo;
+that is withdrawn. If a second backend is ever needed it becomes a
+**config-selected provider inside this plugin**, not a new repo — which is
+why the pure mapping lives in `src/fiscalsign` (the provider seam) rather
+than inline in `main.go`. One real limit is recorded in that ADR: a
+*hardware* TSE (Swissbit) still cannot live here, because it needs
+`runtime:"go"` for raw USB and this plugin is `wasm`; that is the moment to
+split, and it is blocked on #605 regardless.
+
+**`sale.completed` was REMOVED**, along with this plugin's own
+`unsigned_queue`. An earlier draft kept both hooks; an independent review
+proved that combination corrupts every successful sale — core fires
+`fiscal.sign.ask` at tender and `sale.completed` after, `txID` is
+deterministic per sale, so the second hook re-`PUT`s an already-`FINISHED`
+fiskaly transaction, gets a 400, and then writes a false "fiskaly was NOT
+reached" log, overwrites `tse_result:<sale_id>` from signed to failed, and
+adds a permanent queue entry (queue grows to 200, then costs 200 failing
+round-trips per sale). Core now owns the whole failure surface properly
+— journal marker, receipt notice, operator alert, background re-ask with
+`retry: true` — so a private retry loop was redundant as well as harmful.
+**Do not re-add `sale.completed` for signing.**
+
 **The plugin REFUSES to sign an unbalanced receipt** (`fiscalsign.BalanceDelta`).
 fiskaly renders `standard_v1` into DSFinV-K's `Beleg^<gross per VAT
 rate>^<per payment type>`, whose halves must be equal — but a tip rides the

@@ -240,14 +240,23 @@ added a permanent queue entry.
 
 **Two sales that will NOT sign today, deliberately.** A sale carrying a
 **tip**, or a **sale-level discount / service charge**, produces a receipt
-whose two halves disagree (fiskaly renders `standard_v1` into DSFinV-K's
-`Beleg^<gross per VAT rate>^<per payment type>`, and those must be equal —
-a tip has no VAT bucket, and a whole-bill discount moves the total but not
-the per-line breakdown). The plugin refuses to sign such a receipt and
-answers `unreachable`, so the sale completes, is marked unsigned, prints
-the outage notice and is retried — rather than writing an **irreversible**
-TSE record that misstates the sale. The correct German representation is an
-open question with an accountant: **ut-docs#833**.
+whose two halves cannot be reconciled (fiskaly renders `standard_v1` into
+DSFinV-K's `Beleg^<gross per VAT rate>^<per payment type>`, and those must
+be equal — a tip has no VAT bucket, and a whole-bill discount moves the
+total but not the per-line breakdown, which the payload never breaks out).
+The plugin refuses to sign such a receipt and answers `unreachable`, so the
+sale completes, is marked unsigned, prints the outage notice and is retried
+— rather than writing an **irreversible** TSE record that misstates the
+sale. Tip treatment is an open accountant question (**ut-docs#833**); the
+missing payload fields are **ut-docs#834**.
+
+**Ordinary sales — including tax-inclusive German pricing — do sign.** The
+payload carries no `tax_inclusive` flag even though core fills
+`vat_breakdown` differently for each convention (inclusive puts the *gross*
+in `net`; exclusive puts the true net there and adds `tax` on top). The
+plugin deduces which by testing which reading reconciles with `total`.
+Reading inclusive pricing as exclusive would double-count the tax and, with
+the balance check above, refuse to sign every real German sale.
 
 **`handleTaxRateAsk` (dine-in/takeaway VAT switching) is real, and is the
 one piece of this plugin actually verified against a real wazero-compiled

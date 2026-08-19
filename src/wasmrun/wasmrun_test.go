@@ -470,3 +470,40 @@ func TestFiscalSignAsk_EvidenceIsCompleteAndRFC3339(t *testing.T) {
 		}
 	}
 }
+
+// An ordinary German sale: tax-INCLUSIVE pricing, no tip, no discount. It
+// must sign. Core puts the gross in vat_breakdown[].net and the contained
+// tax in .tax for this convention, and the payload has no flag saying so —
+// an earlier version of the balance check read it as tax-exclusive, which
+// would have refused to sign every real sale in a German shop.
+func TestFiscalSignAsk_OrdinaryTaxInclusiveGermanSaleSigns(t *testing.T) {
+	wasm := buildWasm(t)
+	const inclusive = `{
+	  "type": "fiscal.sign.ask",
+	  "payload": {
+	    "sale_id": "sale-de-1",
+	    "currency": "EUR",
+	    "total": 1368,
+	    "payments": [{"method": "cash", "amount": 1368}],
+	    "vat_breakdown": [
+	      {"rate_bp": 1900, "net": 833, "tax": 133},
+	      {"rate_bp": 700,  "net": 535, "tax": 35}
+	    ]
+	  }
+	}`
+	out, h := run(t, wasm, configuredHost(scriptedFiskaly(t)), inclusive)
+	if s := statusOf(t, out, h); s != "approved" {
+		t.Fatalf("status = %q, want approved — this is a plain German sale (logs: %v)", s, h.logs)
+	}
+	body := strings.ReplaceAll(h.calls[2].Body(), " ", "")
+	// Gross per rate is net as-is here, NOT net+tax: 8.33 and 5.35,
+	// summing to the 13.68 actually paid.
+	for _, want := range []string{`"amount":"8.33"`, `"amount":"5.35"`, `"amount":"13.68"`} {
+		if !strings.Contains(body, want) {
+			t.Errorf("finish body missing %s\nbody: %s", want, body)
+		}
+	}
+	if strings.Contains(body, `"amount":"9.66"`) || strings.Contains(body, `"amount":"5.70"`) {
+		t.Error("tax double-counted — net+tax was used where net is already gross")
+	}
+}
