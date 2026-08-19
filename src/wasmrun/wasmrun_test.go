@@ -32,6 +32,7 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -175,18 +176,23 @@ func buildWasm(t *testing.T) []byte {
 	// caught by deliberately mutating main.go and watching this suite
 	// wrongly stay green (2026-08-19). A test that cannot notice the code
 	// changing is not a test.
+	// Walk, don't ReadDir: the first version of this only covered
+	// src/*.go, so a mutation to src/fiscalsign or src/fiskalyparse — where
+	// the balance check and the evidence parsing actually live — was still
+	// cached as a PASS. Caught by the second-round review.
 	srcDir := filepath.Join(root, "src")
-	entries, err := os.ReadDir(srcDir)
+	err = filepath.WalkDir(srcDir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() || !strings.HasSuffix(path, ".go") {
+			return nil
+		}
+		_, readErr := os.ReadFile(path)
+		return readErr
+	})
 	if err != nil {
-		t.Fatalf("read src dir: %v", err)
-	}
-	for _, e := range entries {
-		if e.IsDir() || !strings.HasSuffix(e.Name(), ".go") {
-			continue
-		}
-		if _, err := os.ReadFile(filepath.Join(srcDir, e.Name())); err != nil {
-			t.Fatalf("read %s: %v", e.Name(), err)
-		}
+		t.Fatalf("registering guest sources as cache inputs: %v", err)
 	}
 
 	out := filepath.Join(t.TempDir(), "plugin.wasm")

@@ -53,24 +53,26 @@
 //     tax-advisor sign-off is required before any merchant relies on this
 //     plugin for a live business. See README.md.
 //
-// OFFLINE-FIRST TENSION (ADR-0025's flagged-but-unresolved open question):
-// `sale.completed` is dispatched NON-BLOCKING and fires AFTER the sale has
-// already completed (confirmed against universal-till's
-// internal/plugins/ipc.go / wasm_runtime.go: non-blocking events are
-// enqueued to a drainer goroutine whose result is discarded — a plugin
-// error here is logged, never retried, never surfaced to the till operator
-// or any UI). Concretely: this plugin has NO architectural way to block or
-// reverse a sale if fiskaly is unreachable — by the time it runs, the till
-// has already completed the sale per ADR-0003 (offline-first, non-
-// negotiable). What it CAN do, and does: never fabricate a signature. A
-// failed sign attempt is logged loudly and the sale is recorded as
-// "unsigned, pending retry" in plugin storage (queued the same way
-// ut-plugin-integration-webhook queues undelivered sales) instead of being
-// silently marked as compliant. Whether an unsigned-then-backfilled sale
-// satisfies KassenSichV's "irreversible, tamper-proof at time of
-// transaction" requirement is exactly the question ADR-0025 flags as
-// needing real TSE-vendor/legal confirmation — NOT decided or resolved by
-// this code.
+// OFFLINE-FIRST TENSION — RESOLVED 2026-08-19 (ut-docs#818). This block
+// previously described `sale.completed`'s dead end: dispatched
+// NON-BLOCKING and fired AFTER the sale, so this plugin had no
+// architectural way to block, reverse or even declare a sale when fiskaly
+// was unreachable, and worked around it with a private "unsigned, pending
+// retry" queue. That hook and that queue are GONE.
+//
+// The plugin now answers `fiscal.sign.ask`: blocking, tender-phase, 3000ms
+// budget, `proceed-and-declare`. Core owns the whole failure surface —
+// audit-journal marker, receipt outage notice, operator alert, background
+// re-ask — so a failure is declared and visible, never silent, and the sale
+// still never blocks on connectivity (ADR-0003 intact).
+//
+// What ADR-0025 flagged and did NOT resolve is still not resolved here:
+// whether an unsigned-then-backfilled sale satisfies KassenSichV's
+// "irreversible, tamper-proof at time of transaction" requirement is a
+// legal/TSE-vendor question, not something this code decides.
+//
+// Two hard rules survive: never fabricate a signature, and never sign a
+// receipt already known to misstate the sale (see fiscalsign.BalanceDelta).
 package main
 
 import (
@@ -611,8 +613,9 @@ func handleTaxRateAsk(raw []byte) {
 
 // recordResult persists the sign attempt's outcome (signed or not) keyed by
 // sale id, so a future report/reconciliation surface can enumerate unsigned
-// sales. Deliberately separate from the retry queue: this is a permanent
-// audit record, the queue is transient retry state.
+// sales. A permanent audit record. (It used to be contrasted with this
+// plugin's own transient retry queue; that queue was removed in v0.4.0 —
+// core owns retry now.)
 func recordResult(res tseSignResult) {
 	storagePut("tse_result:"+res.SaleID, mustJSON(res))
 }

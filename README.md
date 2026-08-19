@@ -37,7 +37,9 @@ vs. "researched, not tested":
 Two canonical-type entries in one manifest, per ADR-0025 (no new plugin type
 needed, ADR-0002's `tax`/`export` types already exist):
 
-- **`tax` — TSE signing.** Hooks `sale.completed`. For each completed sale,
+- **`tax` — TSE signing.** Hooks **`fiscal.sign.ask`** (core's real,
+  blocking, tender-phase signing point — `sale.completed` was removed in
+  v0.4.0). For each sale,
   attempts a real two-call TSE-sign round-trip against fiskaly's SIGN DE API:
   start the transaction (`state: ACTIVE`), then finish it (`state:
   FINISHED`) with a receipt schema built from the sale's real line items
@@ -65,28 +67,26 @@ needed, ADR-0002's `tax`/`export` types already exist):
 
 ## Known gaps (read before assuming this "just works")
 
-1. **Cloud-TSE vs. offline-first — the tension ADR-0025 explicitly flags as
-   unresolved, not solved here.** `sale.completed` is dispatched
-   **non-blocking** and fires **after** the sale has already completed
-   (confirmed against `universal-till/internal/plugins/ipc.go` and
-   `wasm_runtime.go`: non-blocking events are enqueued to a drainer
-   goroutine whose result is discarded — a plugin error is logged, never
-   retried, never surfaced to the operator or any UI). Concretely: **this
-   plugin has no architectural way to block or reverse a sale if fiskaly is
-   unreachable.** By the time it runs, the till has already completed the
-   sale, per ADR-0003's non-negotiable offline-first requirement. What this
-   code does instead: it **never fabricates a signature**. A failed sign
-   attempt is logged loudly (`log_write`) and the sale is recorded as
-   "unsigned, pending retry" in plugin storage (same bounded-queue pattern
-   `ut-plugin-integration-webhook` uses for undelivered sales), rather than
-   silently marked compliant. Whether an unsigned-then-backfilled sale
-   satisfies KassenSichV's "irreversible, tamper-proof at time of
-   transaction" requirement is exactly the open question ADR-0025 flags as
-   needing real TSE-vendor/legal confirmation — **not decided or resolved
-   by this plugin.** A local/hardware TSE path (dongle or TSE-integrated
-   printer) may end up being the right primary target specifically because
-   of this tension; that's a real decision for whoever takes this further,
-   not something this skeleton commits to.
+1. **Cloud-TSE vs. offline-first — the *architectural* half is resolved
+   (v0.4.0); the *legal* half is not.** This gap previously described
+   `sale.completed`'s dead end: non-blocking, fired after the sale, so the
+   plugin could not block, reverse or even declare a failure, and worked
+   around it with a private "unsigned, pending retry" queue. **That hook
+   and that queue are gone.** The plugin answers `fiscal.sign.ask` — a
+   blocking, tender-phase point with a 3000 ms budget and a
+   `proceed-and-declare` policy — so core provides the journal marker,
+   receipt outage notice, operator alert and background re-ask. A failure
+   is now declared and visible, and the sale still never blocks on
+   connectivity (ADR-0003 intact).
+
+   What is **still unresolved**, exactly as ADR-0025 flags it: whether an
+   unsigned-then-backfilled sale satisfies KassenSichV's "irreversible,
+   tamper-proof at time of transaction" requirement. That needs real
+   TSE-vendor/legal confirmation and is **not decided by this plugin**. A
+   local/hardware TSE (dongle or TSE-integrated printer) may still be the
+   right primary target for exactly that reason — ADR-0044 Decision 2 says
+   so, and ADR-0055 records that such a backend cannot live in this wasm
+   plugin anyway.
 
 2. **DSFinV-K export is now reachable from the till (ut-docs#189), but only
    as a trigger.** A manager's Data/Export page action publishes the
@@ -192,14 +192,17 @@ what this does and doesn't prove):**
   all use UUIDs; this derives a deterministic pseudo-UUID from the sale id
   since the till's `sale_id` isn't guaranteed to already be one. Whether
   fiskaly strictly requires a v4 UUID or accepts any unique string is
-  unconfirmed. **Known related gap, not yet fixed**: because `txID` is
-  deterministic, the unsigned-retry queue re-submitting the *same* sale
-  re-issues `tx_revision=1` against a transaction id fiskaly may have
-  already partially consumed on the first attempt (e.g. if `start`
-  succeeded but `finish` failed) — that retry can conflict forever instead
-  of draining. Not introduced by the 2026-08-18 fix (no call reached
-  fiskaly at all before it), but now a live, reachable risk instead of a
-  theoretical one. Tracked as a follow-up card.
+  unconfirmed. **Known related gap, not yet fixed** (ut-docs#819): because
+  `txID` is deterministic, a retry of the *same* sale re-issues
+  `tx_revision=1` against a transaction id fiskaly may have already
+  partially consumed on the first attempt (e.g. `start` succeeded but
+  `finish` failed) — that retry can conflict forever instead of draining.
+  The plugin's own retry queue was removed in v0.4.0, but this survives
+  unchanged: **core** now re-asks with `retry: true`, against the same
+  deterministic `txID`. The fix is to `GET` the transaction on
+  `start_failed` and adopt an existing `FINISHED` signature — real 2xx
+  evidence, never inferring "400 means it was signed", which would break
+  the never-fabricate rule.
 - The DSFinV-K `/export` trigger request/response shape — reconstructed
   from fiskaly support docs ("ByBusinessDate"/"ByCreationDate" selection,
   TAR/ZIP format), not confirmed.
