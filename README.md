@@ -264,7 +264,11 @@ the balance check above, refuse to sign every real German sale.
 **`handleTaxRateAsk` (dine-in/takeaway VAT switching) is real, and is the
 one piece of this plugin actually verified against a real wazero-compiled
 run** (see the status table above) — no fiskaly dependency, so nothing
-about it needed a sandbox account.
+about it needed a sandbox account. The rule itself — the
+takeaway_rate_overrides lookup that produces Germany's (product tax class
+x consumption mode) matrix (ut-docs#1013) — is extracted into `src/taxrate`
+so it also has direct host-level unit coverage of the full matrix,
+independent of the wasm-level check.
 
 ## Configure (plugin settings)
 
@@ -361,8 +365,8 @@ bash scripts/build.sh   # -> bin/plugin.wasm (GOOS=wasip1 GOARCH=wasm)
 ```
 
 `go build ./...` from the repo root now builds the host-side packages
-(`src/datev`, `src/fiskalyparse`, `src/fiscalsign`, and the `src/wasmrun`
-test package) and silently skips `src/main.go`, which is gated
+(`src/datev`, `src/fiskalyparse`, `src/fiscalsign`, `src/taxrate`, and the
+`src/wasmrun` test package) and silently skips `src/main.go`, which is gated
 `//go:build wasip1`. It therefore does NOT prove the plugin itself compiles
 — the real build check is still `scripts/build.sh`, which cross-compiles for
 the actual target. (Before 2026-08-19 this repo had only `src/datev` outside
