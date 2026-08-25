@@ -581,11 +581,12 @@ func handleFiscalSignAsk(raw []byte) {
 // configured via the takeaway_rate_overrides setting (a JSON object,
 // tax_code_id → basis points), NOT hardcoded here: a real German café's
 // catalog varies (e.g. only some drinks, not food), and this plugin has no
-// way to know a shop's own tax-code IDs in advance. There is currently no
-// dedicated settings UI for this beyond editing the JSON value directly
-// (same pre-existing gap noted in universal-till's
-// docs/code-reviews/2026-07-28-order-type-tax-switching.md, now on the
-// plugin side instead of core's) — a real follow-up, not built here.
+// way to know a shop's own tax-code IDs in advance. Core ships a dedicated
+// typed editor for this setting (universal-till's
+// internal/pages/plugin_settings_page.go, buildTaxOverrideRows/
+// parseTaxOverrides) rather than leaving a merchant to hand-edit the raw
+// JSON.
+
 func handleTaxRateAsk(raw []byte) {
 	var wrapper struct {
 		Payload json.RawMessage `json:"payload"`

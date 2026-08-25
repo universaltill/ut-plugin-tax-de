@@ -46,8 +46,13 @@ const OrderTypeTakeaway = "takeaway"
 //   - a tax code with no configured override -- e.g. food, which German
 //     law already taxes at 7% in both modes since 2026-01-01, so there is
 //     nothing to switch. "No entry" and "an entry present but <= 0" mean
-//     the same thing: a merchant clearing an override via the settings
-//     UI may write either.
+//     the same thing here: the setting is a raw JSON blob (core's typed
+//     editor, plugin_settings_page.go's buildTaxOverrideRows/
+//     parseTaxOverrides, deletes the key on clear and rejects <= 0
+//     outright -- but this function has no way to know the JSON came from
+//     that editor rather than a hand-edit, an older core version, or a
+//     future tool), so both shapes must resolve identically rather than
+//     trusting the writer to have normalized one away.
 //
 // A configured override whose basis points happen to equal the line's
 // own dine-in rate (the "no-op override" case -- e.g. pure coffee, taxed

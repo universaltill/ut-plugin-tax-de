@@ -261,12 +261,11 @@ plugin deduces which by testing which reading reconciles with `total`.
 Reading inclusive pricing as exclusive would double-count the tax and, with
 the balance check above, refuse to sign every real German sale.
 
-**`handleTaxRateAsk` (dine-in/takeaway VAT switching) is real, and is the
-one piece of this plugin verified against a real wazero-compiled run** — no
-fiskaly dependency, so nothing about it needed a sandbox account. Until
-ut-docs#1013, that run was ad-hoc and uncommitted (the harness itself was
-never kept, only its result recorded in the status table above) — `go test
-./src/wasmrun/...` now COMMITS two cases,
+**`handleTaxRateAsk` (dine-in/takeaway VAT switching) is real, and needs no
+fiskaly dependency** — nothing about it needed a sandbox account. Until
+ut-docs#1013, its only wazero verification was ad-hoc and uncommitted (the
+harness itself was never kept, only its result recorded in the status
+table above) — `go test ./src/wasmrun/...` now COMMITS two cases,
 `TestTaxRateAsk_TakeawayOverrideAnswersReducedRate` and
 `TestTaxRateAsk_DineInAnswersNothing`, driving the real compiled
 `bin/plugin.wasm` through wazero exactly like the `fiscal.sign.ask`
