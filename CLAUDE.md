@@ -238,6 +238,18 @@ export" bullet and its Known gaps #5/#6.
   are pinned by tests and must not regress**: the amount signed per VAT
   bucket is GROSS (`net + tax`, not net — sending net under-declares every
   sale), and a payment's tip is included in its signed total.
+- `src/taxrate/` — the pure, host-independent half of the `tax.rate.ask`
+  answerer (ut-docs#1013): the takeaway_rate_overrides lookup that
+  produces Germany's (product tax class x consumption mode) VAT matrix.
+  Same reason as `src/fiscalsign/` — no wasip1 tag, so
+  `go test ./src/taxrate/...` runs on the host, `main.go` cannot be
+  unit-tested directly. **One invariant is pinned by tests and must not
+  regress**: an override whose basis points equal the line's own rate
+  (a "no-op override", e.g. pure coffee at 19% in both modes) still
+  answers `ok=true` and must not churn or silently drop across however
+  the overrides JSON was last (re)serialized — same failure shape as the
+  tax-code equal-pair bug fixed in ut-docs#536, generalized to this
+  setting.
 - `src/wasmrun/` — test-only. Runs the REAL compiled `plugin.wasm` through
   a real wazero runtime with stubbed host functions, asserting the
   `fiscal.sign.ask` request bodies and the exact stdout JSON for the
@@ -281,9 +293,9 @@ export" bullet and its Known gaps #5/#6.
 ## Before committing
 
 - `go test ./...` — now covers `src/datev`, `src/fiskalyparse`,
-  `src/fiscalsign` and `src/wasmrun` (the last actually compiles and runs
-  the plugin as wasm, so it is slower than the rest; `src/main.go` remains
-  untestable directly, wasip1-only).
+  `src/fiscalsign`, `src/taxrate` and `src/wasmrun` (the last actually
+  compiles and runs the plugin as wasm, so it is slower than the rest;
+  `src/main.go` remains untestable directly, wasip1-only).
 - `bash scripts/build.sh` (the real build check — cross-compiles
   `GOOS=wasip1 GOARCH=wasm`).
 - `bash scripts/validate.sh` (manifest shape: `canonical_type: tax`,

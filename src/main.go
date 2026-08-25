@@ -88,6 +88,7 @@ import (
 	"github.com/universaltill/ut-plugin-tax-de/src/datev"
 	"github.com/universaltill/ut-plugin-tax-de/src/fiscalsign"
 	"github.com/universaltill/ut-plugin-tax-de/src/fiskalyparse"
+	"github.com/universaltill/ut-plugin-tax-de/src/taxrate"
 )
 
 // --- host functions (module "ut", see ut-docs reference/plugin-host-functions.md) ---
@@ -574,12 +575,15 @@ func handleFiscalSignAsk(raw []byte) {
 // falls back to the line's own configured rate.
 //
 // The actual rule — which tax codes switch to which reduced rate on
-// takeaway — is merchant-configured via the takeaway_rate_overrides
-// setting (a JSON object, tax_code_id → basis points), NOT hardcoded here:
-// a real German café's catalog varies (e.g. only some drinks, not food),
-// and this plugin has no way to know a shop's own tax-code IDs in advance.
-// There is currently no dedicated settings UI for this beyond editing the
-// JSON value directly (same pre-existing gap noted in universal-till's
+// takeaway, and the full (product tax class x consumption mode) matrix it
+// produces (ut-docs#1013) — lives in the taxrate package, host-testable
+// independently of this wasip1-only file. The rule itself is merchant-
+// configured via the takeaway_rate_overrides setting (a JSON object,
+// tax_code_id → basis points), NOT hardcoded here: a real German café's
+// catalog varies (e.g. only some drinks, not food), and this plugin has no
+// way to know a shop's own tax-code IDs in advance. There is currently no
+// dedicated settings UI for this beyond editing the JSON value directly
+// (same pre-existing gap noted in universal-till's
 // docs/code-reviews/2026-07-28-order-type-tax-switching.md, now on the
 // plugin side instead of core's) — a real follow-up, not built here.
 func handleTaxRateAsk(raw []byte) {
@@ -590,21 +594,13 @@ func handleTaxRateAsk(raw []byte) {
 	var ask taxRateAskPayload
 	_ = json.Unmarshal(wrapper.Payload, &ask)
 
-	if ask.OrderType != "takeaway" {
-		os.Exit(0) // dine-in/standard: this plugin has no opinion, use the line's own rate
+	bp, ok, err := taxrate.Resolve(ask.OrderType, ask.TaxCodeID, func() string { return setting("takeaway_rate_overrides") })
+	if err != nil {
+		logf("tax-de: takeaway_rate_overrides setting is not valid JSON: %v", err)
+		os.Exit(0)
 	}
-
-	overrides := map[string]int{}
-	if raw := strings.TrimSpace(setting("takeaway_rate_overrides")); raw != "" {
-		if err := json.Unmarshal([]byte(raw), &overrides); err != nil {
-			logf("tax-de: takeaway_rate_overrides setting is not valid JSON: %v", err)
-			os.Exit(0)
-		}
-	}
-
-	bp, ok := overrides[ask.TaxCodeID]
-	if !ok || bp <= 0 {
-		os.Exit(0) // no override configured for this tax code — stays pinned to its own rate
+	if !ok {
+		os.Exit(0) // no opinion on this line — stays pinned to its own rate
 	}
 
 	fmt.Print(string(mustJSON(map[string]int{"rate_bp": bp})))
