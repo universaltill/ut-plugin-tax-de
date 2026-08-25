@@ -594,7 +594,7 @@ func handleTaxRateAsk(raw []byte) {
 	var ask taxRateAskPayload
 	_ = json.Unmarshal(wrapper.Payload, &ask)
 
-	bp, ok, err := taxrate.Resolve(ask.OrderType, ask.TaxCodeID, setting("takeaway_rate_overrides"))
+	bp, ok, err := taxrate.Resolve(ask.OrderType, ask.TaxCodeID, func() string { return setting("takeaway_rate_overrides") })
 	if err != nil {
 		logf("tax-de: takeaway_rate_overrides setting is not valid JSON: %v", err)
 		os.Exit(0)

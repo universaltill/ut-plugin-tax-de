@@ -12,6 +12,12 @@
 // committed proof that the compiled artefact — not the source — dispatches
 // `fiscal.sign.ask` and emits the JSON the contract requires.
 //
+// `tax.rate.ask` itself only got its OWN committed case here later
+// (ut-docs#1013 review finding): the ad-hoc run mentioned above was never
+// turned into a kept test at the time #818 landed, so for a while this
+// package proved `fiscal.sign.ask` alone. `TestTaxRateAsk_*` below closes
+// that gap the same way.
+//
 // WHAT THIS PROVES: the wasm module dispatches on event type, reads its
 // settings through the host ABI, issues the fiskaly HTTP calls in the right
 // order with the right bodies, parses a real-shaped response, and writes
@@ -511,5 +517,63 @@ func TestFiscalSignAsk_OrdinaryTaxInclusiveGermanSaleSigns(t *testing.T) {
 	}
 	if strings.Contains(body, `"amount":"9.66"`) || strings.Contains(body, `"amount":"5.70"`) {
 		t.Error("tax double-counted — net+tax was used where net is already gross")
+	}
+}
+
+// TestTaxRateAsk_TakeawayOverrideAnswersReducedRate is this repo's first
+// COMMITTED wasm-level proof for "tax.rate.ask" (ut-docs#1013 review
+// finding): before this, the only evidence the compiled plugin dispatched
+// this event and wired taxRateAskPayload's fields onto taxrate.Resolve in
+// the right order was an ad-hoc, uncommitted wazero run (see this file's
+// package doc comment, and README's status table). taxrate.Resolve takes
+// three same-typed strings (orderType, taxCodeID) plus a func — a mistake
+// swapping the first two at the call site in main.go would pass every test
+// in both the taxrate and pos packages (neither can see main.go's call
+// site) while being wrong for every real till. This test is the one place
+// that can catch it: it drives the REAL compiled main.go, not a mock of it.
+func TestTaxRateAsk_TakeawayOverrideAnswersReducedRate(t *testing.T) {
+	wasm := buildWasm(t)
+	h := &stubHost{
+		settings: map[string]string{
+			"takeaway_rate_overrides": `{"tax-milk-drink":700}`,
+		},
+		storage: map[string][]byte{},
+	}
+	const ask = `{
+	  "type": "tax.rate.ask",
+	  "payload": {"item_id": "item-cappuccino", "tax_code_id": "tax-milk-drink", "tax_rate_bp": 1900, "order_type": "takeaway"}
+	}`
+	out, _ := run(t, wasm, h, ask)
+	var got struct {
+		RateBP int `json:"rate_bp"`
+	}
+	if err := json.Unmarshal([]byte(strings.TrimSpace(out)), &got); err != nil {
+		t.Fatalf("stdout not the {\"rate_bp\":N} shape the tax.rate.ask contract requires: %v\nstdout: %q\nlogs: %v", err, out, h.logs)
+	}
+	if got.RateBP != 700 {
+		t.Fatalf("rate_bp = %d, want 700 (the configured takeaway override) — a swapped argument order at the main.go call site would produce a different wrong answer here without failing any other test", got.RateBP)
+	}
+}
+
+// TestTaxRateAsk_DineInAnswersNothing pins the dine-in short-circuit at the
+// compiled-plugin level too (taxrate_test.go's
+// TestResolve_DineInNeverConsultsOverrides pins it at the Resolve level;
+// this is the same guarantee one layer up, through the real wasip1 binary
+// and its real host settings_get call).
+func TestTaxRateAsk_DineInAnswersNothing(t *testing.T) {
+	wasm := buildWasm(t)
+	h := &stubHost{
+		settings: map[string]string{
+			"takeaway_rate_overrides": `{"tax-milk-drink":700}`,
+		},
+		storage: map[string][]byte{},
+	}
+	const ask = `{
+	  "type": "tax.rate.ask",
+	  "payload": {"item_id": "item-cappuccino", "tax_code_id": "tax-milk-drink", "tax_rate_bp": 1900, "order_type": ""}
+	}`
+	out, _ := run(t, wasm, h, ask)
+	if strings.TrimSpace(out) != "" {
+		t.Fatalf("dine-in produced an answer, want no opinion (empty stdout): %q", out)
 	}
 }

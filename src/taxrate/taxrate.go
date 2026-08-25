@@ -23,17 +23,26 @@ const OrderTypeTakeaway = "takeaway"
 //
 // orderType is the sale's order type as sent in the ask payload ("" for
 // dine-in/standard, or OrderTypeTakeaway). taxCodeID identifies the
-// line's tax code. overridesJSON is the merchant-configured
-// takeaway_rate_overrides plugin setting verbatim: a JSON object mapping
-// tax_code_id -> takeaway basis points (possibly "", meaning nothing
-// configured yet).
+// line's tax code. overridesJSON is called to fetch the merchant-
+// configured takeaway_rate_overrides plugin setting verbatim -- a JSON
+// object mapping tax_code_id -> takeaway basis points, possibly ""
+// meaning nothing configured yet -- and is deliberately a FUNC, not a
+// plain string: on the dine-in path this plugin has no opinion regardless
+// of what the setting holds, and must never call it at all. In main.go
+// that call is a real host round-trip (settings_get -> a SQLite read via
+// the plugin engine's host functions on every single ask), so evaluating
+// it eagerly on every dine-in line -- the common case, most receipts --
+// would be a real, avoidable cost, not just a style choice. This mirrors
+// the original inline handler's own order-type-first short-circuit
+// exactly (see TestResolve_DineInNeverConsultsOverrides).
 //
 // ok=false means this plugin has no opinion on the line -- core falls
 // back to the line's own configured rate unchanged (exactly the pre-tax-
 // plugin default). That is the correct answer for:
 //
 //   - dine-in (orderType != OrderTypeTakeaway): §12 UStG's switch only
-//     ever pulls a rate DOWN for takeaway, it never touches dine-in.
+//     ever pulls a rate DOWN for takeaway, it never touches dine-in --
+//     and overridesJSON is never even called for this case.
 //   - a tax code with no configured override -- e.g. food, which German
 //     law already taxes at 7% in both modes since 2026-01-01, so there is
 //     nothing to switch. "No entry" and "an entry present but <= 0" mean
@@ -49,14 +58,14 @@ const OrderTypeTakeaway = "takeaway"
 // never silently drop it or churn its value (ut-docs#536's failure mode,
 // generalized from tax codes to this setting).
 //
-// err is non-nil only when overridesJSON is non-empty and not valid JSON
-// -- the caller decides what to do (main.go logs and answers "no
+// err is non-nil only when overridesJSON() is non-empty and not valid
+// JSON -- the caller decides what to do (main.go logs and answers "no
 // opinion", same as if the setting were unset).
-func Resolve(orderType, taxCodeID, overridesJSON string) (bp int, ok bool, err error) {
+func Resolve(orderType, taxCodeID string, overridesJSON func() string) (bp int, ok bool, err error) {
 	if orderType != OrderTypeTakeaway {
 		return 0, false, nil
 	}
-	overrides, err := ParseOverrides(overridesJSON)
+	overrides, err := ParseOverrides(overridesJSON())
 	if err != nil {
 		return 0, false, err
 	}
@@ -69,15 +78,20 @@ func Resolve(orderType, taxCodeID, overridesJSON string) (bp int, ok bool, err e
 
 // ParseOverrides parses the takeaway_rate_overrides plugin setting (a JSON
 // object, tax_code_id -> takeaway basis points). An empty/whitespace-only
-// string is a valid "nothing configured yet" state, not an error.
+// string is a valid "nothing configured yet" state, not an error, and
+// always returns a non-nil map (never JSON `null`'s zero value) so a
+// caller can range over or index the result without a nil check.
 func ParseOverrides(raw string) (map[string]int, error) {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
 		return map[string]int{}, nil
 	}
-	var overrides map[string]int
+	overrides := map[string]int{}
 	if err := json.Unmarshal([]byte(raw), &overrides); err != nil {
 		return nil, err
+	}
+	if overrides == nil { // valid JSON `null` unmarshals to a nil map
+		overrides = map[string]int{}
 	}
 	return overrides, nil
 }

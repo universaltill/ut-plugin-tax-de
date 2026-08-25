@@ -262,9 +262,15 @@ Reading inclusive pricing as exclusive would double-count the tax and, with
 the balance check above, refuse to sign every real German sale.
 
 **`handleTaxRateAsk` (dine-in/takeaway VAT switching) is real, and is the
-one piece of this plugin actually verified against a real wazero-compiled
-run** (see the status table above) — no fiskaly dependency, so nothing
-about it needed a sandbox account. The rule itself — the
+one piece of this plugin verified against a real wazero-compiled run** — no
+fiskaly dependency, so nothing about it needed a sandbox account. Until
+ut-docs#1013, that run was ad-hoc and uncommitted (the harness itself was
+never kept, only its result recorded in the status table above) — `go test
+./src/wasmrun/...` now COMMITS two cases,
+`TestTaxRateAsk_TakeawayOverrideAnswersReducedRate` and
+`TestTaxRateAsk_DineInAnswersNothing`, driving the real compiled
+`bin/plugin.wasm` through wazero exactly like the `fiscal.sign.ask`
+coverage elsewhere in that package. The rule itself — the
 takeaway_rate_overrides lookup that produces Germany's (product tax class
 x consumption mode) matrix (ut-docs#1013) — is extracted into `src/taxrate`
 so it also has direct host-level unit coverage of the full matrix,
