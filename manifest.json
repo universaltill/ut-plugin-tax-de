@@ -1,7 +1,7 @@
 {
   "id": "com.universaltill.tax-de",
   "name": "Germany Fiscal Compliance (TSE + DSFinV-K)",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "Starting-point integration against fiskaly's Cloud-TSE (SIGN DE) API for KassenSichV transaction signing, fiskaly's DSFinV-K export API for tax-audit exports, and a DATEV EXTF Buchungsstapel export for handing sales to an accountant. SIGN DE's fiskaly API contract (host, auth, TSS/transaction lifecycle, receipt schema) was verified 2026-08-18 against a real fiskaly sandbox; DSFinV-K export and legal DSFinV-K compliance are NOT verified, chart-of-accounts mapping for the DATEV export is merchant/accountant-configured (no defaults assumed), and none of this is a substitute for tax-advisor sign-off before any merchant relies on it. See README before installing.",
   "author": "Universal Till",
   "website": "https://universaltill.com",
@@ -39,7 +39,10 @@
       "type": "export",
       "key": "datev-buchungsstapel-export-de",
       "label": "DATEV Buchungsstapel Export (EXTF)",
-      "sort_order": 15
+      "sort_order": 15,
+      "entities": [
+        "eod_closes"
+      ]
     }
   ],
   "settings": [
@@ -99,7 +102,17 @@
       "scope": "global"
     },
     {
-      "key": "datev_konto_kasse",
+      "key": "datev_konten_by_method",
+      "default_value": "{}",
+      "scope": "global"
+    },
+    {
+      "key": "datev_konto_gutschein",
+      "default_value": "",
+      "scope": "global"
+    },
+    {
+      "key": "datev_konto_trinkgeld",
       "default_value": "",
       "scope": "global"
     },

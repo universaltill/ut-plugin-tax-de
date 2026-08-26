@@ -215,10 +215,19 @@ context for whoever wires the dispatcher up.
 `export.requested.ask`, dispatched in `src/main.go` by `payload.EntryKey` —
 if you add a third export entry, extend that switch, don't just check
 against one constant again. Unlike DSFinV-K, the DATEV path needs no
-fiskaly account: it's pure local data transformation (`src/datev`) of the
-`sales[]` the host now sends in the payload (ut-docs#221) into a DATEV EXTF
-CSV, returned inline via `content_b64` — see README's "DATEV Buchungsstapel
-export" bullet and its Known gaps #5/#6.
+fiskaly account: it's pure local data transformation (`src/datev`),
+returned inline via `content_b64`. Since v0.5.0 (ut-docs#1005) the entry
+declares the `eod_closes` entity and the PREFERRED grain is
+`datev.BuildFromCloses`: one posting set per archived day-close the host
+sends in `eod_closes[]` — one row per (payment method x VAT rate) cell of
+that close's own cross-tab plus tip/voucher-liability and cash-skim rows,
+Belegfeld 1 = the close's Z-number, built from the ALREADY-ARCHIVED
+Z-report JSON so it reconciles to the Z-report by construction. When the
+payload has no `eod_closes` (older host, or no archived close in range),
+the legacy per-sale grain (`datev.Build` over `sales[]`, ut-docs#221) still
+answers — see `src/main.go`'s routing comment before changing that
+fallback. See README's "DATEV Buchungsstapel export" bullet, its
+SKR03/SKR04 presets section, and Known gaps #5/#6/#7.
 
 ## Code layout
 

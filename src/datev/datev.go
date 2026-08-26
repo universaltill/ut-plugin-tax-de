@@ -78,7 +78,10 @@ type Settings struct {
 	MandantNr        string            // Mandantennummer (DATEV client number)
 	SachkontenLaenge string            // Sachkontenlänge, digits, e.g. "4" (SKR03/04-standard length — safe structural default, not a real account number)
 	WJBeginn         string            // Wirtschaftsjahresbeginn, MMDD, e.g. "0101" — safe generic default (calendar year), overridable
-	KontoKasse       string            // Konto debited for every booking row (the till's cash/bank collector account) — no default
+	KontoKasse       string            // LEGACY, per-sale Build only: Konto debited for every booking row — superseded for the day-close batch (ut-docs#1005) by KonteByMethod; kept so Build (and any install still on the per-sale path) keeps refusing/working exactly as before
+	KonteByMethod    map[string]string // payment method id -> Konto the money landed on (e.g. {"cash":"1000","card":"1360"}) — no default, must cover every method present in the closes being exported (ut-docs#1005)
+	KontoGutschein   string            // voucher-issuance liability Gegenkonto (e.g. SKR03 1796) — no default; may stay empty until a close actually has vouchers issued
+	KontoTrinkgeld   string            // tip liability Gegenkonto (e.g. SKR03 1363) — no default; may stay empty until a close actually has tips
 	Erloeskonten     map[string]string // tax_rate_bp (as decimal string) -> Gegenkonto (revenue account) — no default, must cover every rate present in the sales being exported
 	BuSchluessel     map[string]string // optional: tax_rate_bp -> BU-Schlüssel override; omitted/empty per rate means "Gegenkonto is already an Automatikkonto, no BU-Schlüssel needed" (the common SKR03/04 convention)
 }
@@ -108,39 +111,15 @@ const herkunftKz = "UT"
 // export's wall-clock time (injected, not time.Now(), so callers/tests are
 // deterministic).
 func Build(from, to string, sales []SaleRow, settings Settings, now time.Time) (*Result, error) {
-	if strings.TrimSpace(settings.BeraterNr) == "" {
-		return nil, fmt.Errorf("datev export: datev_berater_nr is not configured")
-	}
-	if strings.TrimSpace(settings.MandantNr) == "" {
-		return nil, fmt.Errorf("datev export: datev_mandant_nr is not configured")
+	sachkontenLaenge, wjBeginn, err := commonSettingsChecks(settings)
+	if err != nil {
+		return nil, err
 	}
 	if strings.TrimSpace(settings.KontoKasse) == "" {
 		return nil, fmt.Errorf("datev export: datev_konto_kasse is not configured")
 	}
 	if !isDigits(settings.KontoKasse) {
 		return nil, fmt.Errorf("datev export: datev_konto_kasse must be digits only, got %q", settings.KontoKasse)
-	}
-	for rate, konto := range settings.Erloeskonten {
-		if strings.TrimSpace(konto) != "" && !isDigits(konto) {
-			return nil, fmt.Errorf("datev export: datev_erloeskonten[%q] must be digits only, got %q", rate, konto)
-		}
-	}
-	sachkontenLaenge := strings.TrimSpace(settings.SachkontenLaenge)
-	if sachkontenLaenge == "" {
-		sachkontenLaenge = "4"
-	}
-	wjBeginn := strings.TrimSpace(settings.WJBeginn)
-	if wjBeginn == "" {
-		wjBeginn = "0101"
-	}
-	if len(wjBeginn) != 4 || !isDigits(wjBeginn) {
-		return nil, fmt.Errorf("datev export: datev_wj_beginn must be MMDD (4 digits), got %q", wjBeginn)
-	}
-	if wjMonth, _ := strconv.Atoi(wjBeginn[:2]); wjMonth < 1 || wjMonth > 12 {
-		return nil, fmt.Errorf("datev export: datev_wj_beginn month must be 01-12, got %q", wjBeginn)
-	}
-	if wjDay, _ := strconv.Atoi(wjBeginn[2:]); wjDay < 1 || wjDay > 31 {
-		return nil, fmt.Errorf("datev export: datev_wj_beginn day must be 01-31, got %q", wjBeginn)
 	}
 
 	fromDate, err := time.Parse("2006-01-02", from)
@@ -207,7 +186,7 @@ func Build(from, to string, sales []SaleRow, settings Settings, now time.Time) (
 	}
 
 	var sb strings.Builder
-	sb.WriteString(buildHeaderRow1(settings, sachkontenLaenge, wjBeginn, fromDate, toDate, now))
+	sb.WriteString(buildHeaderRow1(settings, sachkontenLaenge, wjBeginn, "0", fromDate, toDate, now))
 	sb.WriteString("\r\n")
 	sb.WriteString(header2Columns)
 	sb.WriteString("\r\n")
@@ -228,7 +207,49 @@ func Build(from, to string, sales []SaleRow, settings Settings, now time.Time) (
 	}, nil
 }
 
-func buildHeaderRow1(settings Settings, sachkontenLaenge, wjBeginn string, fromDate, toDate, now time.Time) string {
+// commonSettingsChecks validates the settings Build and BuildFromCloses
+// share — consultant/client numbers, Erloeskonten digit-safety, and the
+// structural Sachkontenlänge/WJ-Beginn defaults + validation — returning
+// the normalized sachkontenLaenge/wjBeginn. Konto checks specific to one
+// grain (KontoKasse for the per-sale Build; KonteByMethod/KontoGutschein/
+// KontoTrinkgeld for the day-close BuildFromCloses) stay with their builder.
+func commonSettingsChecks(settings Settings) (sachkontenLaenge, wjBeginn string, err error) {
+	if strings.TrimSpace(settings.BeraterNr) == "" {
+		return "", "", fmt.Errorf("datev export: datev_berater_nr is not configured")
+	}
+	if strings.TrimSpace(settings.MandantNr) == "" {
+		return "", "", fmt.Errorf("datev export: datev_mandant_nr is not configured")
+	}
+	for rate, konto := range settings.Erloeskonten {
+		if strings.TrimSpace(konto) != "" && !isDigits(konto) {
+			return "", "", fmt.Errorf("datev export: datev_erloeskonten[%q] must be digits only, got %q", rate, konto)
+		}
+	}
+	sachkontenLaenge = strings.TrimSpace(settings.SachkontenLaenge)
+	if sachkontenLaenge == "" {
+		sachkontenLaenge = "4"
+	}
+	wjBeginn = strings.TrimSpace(settings.WJBeginn)
+	if wjBeginn == "" {
+		wjBeginn = "0101"
+	}
+	if len(wjBeginn) != 4 || !isDigits(wjBeginn) {
+		return "", "", fmt.Errorf("datev export: datev_wj_beginn must be MMDD (4 digits), got %q", wjBeginn)
+	}
+	if wjMonth, _ := strconv.Atoi(wjBeginn[:2]); wjMonth < 1 || wjMonth > 12 {
+		return "", "", fmt.Errorf("datev export: datev_wj_beginn month must be 01-12, got %q", wjBeginn)
+	}
+	if wjDay, _ := strconv.Atoi(wjBeginn[2:]); wjDay < 1 || wjDay > 31 {
+		return "", "", fmt.Errorf("datev export: datev_wj_beginn day must be 01-31, got %q", wjBeginn)
+	}
+	return sachkontenLaenge, wjBeginn, nil
+}
+
+// festschreibung is header row 1's Festschreibung flag: "0" for the per-sale
+// Build (unchanged pre-ut-docs#1005 behavior), "1" for the day-close batch
+// (generated from an ALREADY-ARCHIVED, immutable Z-report — the ticket's
+// "Festschreibung=1, locked" rule).
+func buildHeaderRow1(settings Settings, sachkontenLaenge, wjBeginn, festschreibung string, fromDate, toDate, now time.Time) string {
 	wjYear := fromDate.Year()
 	// The fiscal year containing `from`: if from is before this year's
 	// WJ-start month/day, the fiscal year actually began the PRIOR calendar
@@ -263,7 +284,7 @@ func buildHeaderRow1(settings Settings, sachkontenLaenge, wjBeginn string, fromD
 		"",  // Diktatkürzel
 		"1", // Buchungstyp: 1 = Finanzbuchführung
 		"",  // Rechnungslegungszweck
-		"0", // Festschreibung: 0 = nein
+		festschreibung,
 		q("EUR"),
 		"", "", "", "", "", "", "", "", "", // 9 trailing reserved fields — header row 1 is 31 fields total (reviewer-caught: this was 5, undercounting by 4 against the byte-verified reference)
 	}

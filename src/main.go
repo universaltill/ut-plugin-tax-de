@@ -735,10 +735,39 @@ func handleDATEVExport(from, to string, sales []datev.SaleRow) {
 	os.Exit(0)
 }
 
+// handleDATEVClosesExport answers export.requested.ask for the DATEV entry
+// when the host sent archived day-closes (ut-docs#1005): pure local
+// transformation of the already-archived Z-reports into a DATEV EXTF
+// Buchungsstapel — one posting set per close, keyed to that close's own
+// Z-number — returned inline via content_b64, same cycle as
+// handleDATEVExport.
+func handleDATEVClosesExport(closes []datev.EODCloseExport) {
+	settings, err := datevSettings()
+	if err != nil {
+		logf("tax-de: datev closes export settings invalid: %v", err)
+		fmt.Print(string(mustJSON(map[string]any{"ok": false, "error": err.Error()})))
+		os.Exit(0)
+	}
+	result, err := datev.BuildFromCloses(closes, settings, time.Now().UTC())
+	if err != nil {
+		logf("tax-de: datev closes export failed: %v", err)
+		fmt.Print(string(mustJSON(map[string]any{"ok": false, "error": err.Error()})))
+		os.Exit(0)
+	}
+	logf("tax-de: datev closes export built closes=%d bytes=%d", len(closes), len(result.Content))
+	fmt.Print(string(mustJSON(map[string]any{
+		"ok":          true,
+		"filename":    result.Filename,
+		"content_b64": base64.StdEncoding.EncodeToString(result.Content),
+	})))
+	os.Exit(0)
+}
+
 // datevSettings reads and parses the datev_* plugin settings. Erloeskonten/
-// BuSchluessel are merchant/accountant-configured JSON maps (tax_rate_bp ->
-// account number) — see the datev package's Settings doc comment for why
-// this plugin never defaults them to a guessed real account number.
+// BuSchluessel/KonteByMethod are merchant/accountant-configured JSON maps
+// (tax_rate_bp or payment-method id -> account number) — see the datev
+// package's Settings doc comment for why this plugin never defaults them to
+// a guessed real account number.
 func datevSettings() (datev.Settings, error) {
 	erloeskonten := map[string]string{}
 	if raw := strings.TrimSpace(setting("datev_erloeskonten")); raw != "" && raw != "{}" {
@@ -752,14 +781,29 @@ func datevSettings() (datev.Settings, error) {
 			return datev.Settings{}, fmt.Errorf("datev_bu_schluessel is not valid JSON: %w", err)
 		}
 	}
+	konteByMethod := map[string]string{}
+	if raw := strings.TrimSpace(setting("datev_konten_by_method")); raw != "" && raw != "{}" {
+		if err := json.Unmarshal([]byte(raw), &konteByMethod); err != nil {
+			return datev.Settings{}, fmt.Errorf("datev_konten_by_method is not valid JSON: %w", err)
+		}
+	}
 	return datev.Settings{
 		BeraterNr:        strings.TrimSpace(setting("datev_berater_nr")),
 		MandantNr:        strings.TrimSpace(setting("datev_mandant_nr")),
 		SachkontenLaenge: strings.TrimSpace(setting("datev_sachkontenlaenge")),
 		WJBeginn:         strings.TrimSpace(setting("datev_wj_beginn")),
-		KontoKasse:       strings.TrimSpace(setting("datev_konto_kasse")),
-		Erloeskonten:     erloeskonten,
-		BuSchluessel:     buSchluessel,
+		// datev_konto_kasse was removed from manifest.json's settings[] in
+		// v0.5.0 (replaced by datev_konten_by_method) but is still read:
+		// an install that configured it before upgrading keeps its per-sale
+		// fallback path working (see main()'s routing comment); a fresh
+		// install gets "" here and the per-sale Build keeps refusing with
+		// its clear not-configured error, never a guessed account.
+		KontoKasse:     strings.TrimSpace(setting("datev_konto_kasse")),
+		KonteByMethod:  konteByMethod,
+		KontoGutschein: strings.TrimSpace(setting("datev_konto_gutschein")),
+		KontoTrinkgeld: strings.TrimSpace(setting("datev_konto_trinkgeld")),
+		Erloeskonten:   erloeskonten,
+		BuSchluessel:   buSchluessel,
 	}, nil
 }
 
@@ -785,10 +829,11 @@ func main() {
 	// against a future second export entry in this same plugin.
 	case ev.Type == "export.requested.ask":
 		var payload struct {
-			From     string          `json:"from"`
-			To       string          `json:"to"`
-			EntryKey string          `json:"entry_key"`
-			Sales    []datev.SaleRow `json:"sales"` // ut-docs#221 — only the DATEV path below consumes this; DSFinV-K stays fiskaly-triggered, no local data needed
+			From      string                 `json:"from"`
+			To        string                 `json:"to"`
+			EntryKey  string                 `json:"entry_key"`
+			Sales     []datev.SaleRow        `json:"sales"`      // ut-docs#221 — only the DATEV path below consumes this; DSFinV-K stays fiskaly-triggered, no local data needed
+			EODCloses []datev.EODCloseExport `json:"eod_closes"` // ut-docs#1005 — archived day-closes (Z-reports); sent only when the host supports it AND the range contains archived closes
 		}
 		var wrapper struct {
 			Payload json.RawMessage `json:"payload"`
@@ -817,7 +862,22 @@ func main() {
 
 		switch payload.EntryKey {
 		case datevExportEntryKey:
-			handleDATEVExport(payload.From, payload.To, payload.Sales)
+			// ut-docs#1005: the day-close-grained Buchungsstapel (one
+			// posting set per archived Z-report) is the export a German
+			// accountant actually books, so it's preferred whenever the
+			// host sent eod_closes. The per-sale path is kept as the
+			// fallback — NOT removed — because an empty eod_closes is
+			// indistinguishable between (a) a host from before this
+			// feature that never sends the field and (b) a range in which
+			// no day was ever closed; in both cases the per-sale ledger
+			// grain still produces an honest (differently-grained) batch,
+			// preserving pre-#1005 behavior instead of turning a working
+			// export into a hard failure on rollout.
+			if len(payload.EODCloses) > 0 {
+				handleDATEVClosesExport(payload.EODCloses)
+			} else {
+				handleDATEVExport(payload.From, payload.To, payload.Sales)
+			}
 		case dsfinvkExportEntryKey, "":
 			// "" (no entry_key) preserves this plugin's pre-ut-docs#41
 			// behavior, from when dsfinvk-export-de was its only export
