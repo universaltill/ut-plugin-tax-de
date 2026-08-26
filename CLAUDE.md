@@ -222,12 +222,22 @@ declares the `eod_closes` entity and the PREFERRED grain is
 sends in `eod_closes[]` — one row per (payment method x VAT rate) cell of
 that close's own cross-tab plus tip/voucher-liability and cash-skim rows,
 Belegfeld 1 = the close's Z-number, built from the ALREADY-ARCHIVED
-Z-report JSON so it reconciles to the Z-report by construction. When the
-payload has no `eod_closes` (older host, or no archived close in range),
-the legacy per-sale grain (`datev.Build` over `sales[]`, ut-docs#221) still
-answers — see `src/main.go`'s routing comment before changing that
-fallback. See README's "DATEV Buchungsstapel export" bullet, its
-SKR03/SKR04 presets section, and Known gaps #5/#6/#7.
+Z-report JSON so it reconciles to the Z-report by construction. Routing is
+on the field's PRESENCE, not its length: a supporting host always sends
+`eod_closes` (`[]` when the range holds no archived close — the export
+then refuses with a clear "close the day first" error, never silently
+switching grain); only a payload with the field entirely ABSENT (a
+pre-#1005 host) takes the legacy per-sale grain (`datev.Build` over
+`sales[]`, ut-docs#221) — see `src/main.go`'s routing comment before
+changing that fallback. The voucher-proceeds and skim-destination accounts
+are named directly by `datev_konto_gutschein_zahlung` /
+`datev_konto_geldtransit`, never inferred from `datev_konten_by_method`'s
+cardinality; and `datev_konto_kasse` must STAY declared in
+`manifest.json`'s `settings[]` even though superseded — the host's
+`ReconcilePluginSettings` deletes stored rows for undeclared keys on
+upgrade, which would destroy a merchant's configured value. See README's
+"DATEV Buchungsstapel export" bullet, its SKR03/SKR04 presets section, and
+Known gaps #5/#6/#7.
 
 ## Code layout
 

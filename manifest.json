@@ -102,12 +102,27 @@
       "scope": "global"
     },
     {
+      "key": "datev_konto_kasse",
+      "default_value": "",
+      "scope": "global"
+    },
+    {
       "key": "datev_konten_by_method",
       "default_value": "{}",
       "scope": "global"
     },
     {
       "key": "datev_konto_gutschein",
+      "default_value": "",
+      "scope": "global"
+    },
+    {
+      "key": "datev_konto_gutschein_zahlung",
+      "default_value": "",
+      "scope": "global"
+    },
+    {
+      "key": "datev_konto_geldtransit",
       "default_value": "",
       "scope": "global"
     },

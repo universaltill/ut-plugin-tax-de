@@ -792,18 +792,25 @@ func datevSettings() (datev.Settings, error) {
 		MandantNr:        strings.TrimSpace(setting("datev_mandant_nr")),
 		SachkontenLaenge: strings.TrimSpace(setting("datev_sachkontenlaenge")),
 		WJBeginn:         strings.TrimSpace(setting("datev_wj_beginn")),
-		// datev_konto_kasse was removed from manifest.json's settings[] in
-		// v0.5.0 (replaced by datev_konten_by_method) but is still read:
-		// an install that configured it before upgrading keeps its per-sale
-		// fallback path working (see main()'s routing comment); a fresh
-		// install gets "" here and the per-sale Build keeps refusing with
-		// its clear not-configured error, never a guessed account.
-		KontoKasse:     strings.TrimSpace(setting("datev_konto_kasse")),
-		KonteByMethod:  konteByMethod,
-		KontoGutschein: strings.TrimSpace(setting("datev_konto_gutschein")),
-		KontoTrinkgeld: strings.TrimSpace(setting("datev_konto_trinkgeld")),
-		Erloeskonten:   erloeskonten,
-		BuSchluessel:   buSchluessel,
+		// datev_konto_kasse is LEGACY (superseded for the day-close batch
+		// by datev_konten_by_method in v0.5.0) but stays DECLARED in
+		// manifest.json's settings[] deliberately: the host's
+		// ReconcilePluginSettings deletes every stored plugin_settings row
+		// whose key the manifest no longer declares, so dropping the
+		// declaration would silently destroy an upgraded install's stored
+		// value on upgrade — and with no declaration there'd be no UI to
+		// ever set it again. Kept so the per-sale Build fallback genuinely
+		// keeps working (see main()'s routing comment); a fresh install
+		// gets "" here and Build keeps refusing with its clear
+		// not-configured error, never a guessed account.
+		KontoKasse:            strings.TrimSpace(setting("datev_konto_kasse")),
+		KonteByMethod:         konteByMethod,
+		KontoGutschein:        strings.TrimSpace(setting("datev_konto_gutschein")),
+		KontoGutscheinZahlung: strings.TrimSpace(setting("datev_konto_gutschein_zahlung")),
+		KontoGeldtransit:      strings.TrimSpace(setting("datev_konto_geldtransit")),
+		KontoTrinkgeld:        strings.TrimSpace(setting("datev_konto_trinkgeld")),
+		Erloeskonten:          erloeskonten,
+		BuSchluessel:          buSchluessel,
 	}, nil
 }
 
@@ -833,7 +840,7 @@ func main() {
 			To        string                 `json:"to"`
 			EntryKey  string                 `json:"entry_key"`
 			Sales     []datev.SaleRow        `json:"sales"`      // ut-docs#221 — only the DATEV path below consumes this; DSFinV-K stays fiskaly-triggered, no local data needed
-			EODCloses []datev.EODCloseExport `json:"eod_closes"` // ut-docs#1005 — archived day-closes (Z-reports); sent only when the host supports it AND the range contains archived closes
+			EODCloses []datev.EODCloseExport `json:"eod_closes"` // ut-docs#1005 — archived day-closes (Z-reports); a supporting host always sends the field ("[]" when the range has no archived close), so nil here means a pre-#1005 host — see the routing comment below
 		}
 		var wrapper struct {
 			Payload json.RawMessage `json:"payload"`
@@ -865,15 +872,19 @@ func main() {
 			// ut-docs#1005: the day-close-grained Buchungsstapel (one
 			// posting set per archived Z-report) is the export a German
 			// accountant actually books, so it's preferred whenever the
-			// host sent eod_closes. The per-sale path is kept as the
-			// fallback — NOT removed — because an empty eod_closes is
-			// indistinguishable between (a) a host from before this
-			// feature that never sends the field and (b) a range in which
-			// no day was ever closed; in both cases the per-sale ledger
-			// grain still produces an honest (differently-grained) batch,
-			// preserving pre-#1005 behavior instead of turning a working
-			// export into a hard failure on rollout.
-			if len(payload.EODCloses) > 0 {
+			// host sent eod_closes. The routing key is PRESENCE, not
+			// length: a host that supports eod_closes always sends the
+			// field — "[]" (supported, zero archived closes in range) is
+			// wire-distinguishable from absent/null (a pre-#1005 host that
+			// doesn't know the concept). Present-but-empty therefore goes
+			// to BuildFromCloses, which refuses with its clear
+			// no-closes-in-range error — never a silent fall-back to the
+			// wrong-grain per-sale export. The per-sale path is kept — NOT
+			// removed — solely for a genuinely old host, which sends
+			// sales[] unconditionally and no eod_closes field at all, so
+			// the pre-#1005 behavior is preserved there instead of turning
+			// a working export into a hard failure on rollout.
+			if payload.EODCloses != nil {
 				handleDATEVClosesExport(payload.EODCloses)
 			} else {
 				handleDATEVExport(payload.From, payload.To, payload.Sales)

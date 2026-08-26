@@ -7,10 +7,11 @@ import (
 )
 
 // closesSettings is validSettings' BuildFromCloses counterpart: the
-// method->Konto map replaces the single KontoKasse, plus the two liability
-// Gegenkonten (voucher issuance, tips). Account numbers are the SKR03 ones
-// from ut-docs#1005's reference table — test fixture data, not code
-// defaults (the package still ships no default account numbers).
+// method->Konto map replaces the single KontoKasse, plus the liability
+// Gegenkonten (voucher issuance, tips) and the two dedicated debit/transit
+// accounts (voucher proceeds, cash-skim destination). Account numbers are
+// the SKR03 ones from ut-docs#1005's reference table — test fixture data,
+// not code defaults (the package still ships no default account numbers).
 func closesSettings() Settings {
 	return Settings{
 		BeraterNr:        "1001",
@@ -21,8 +22,10 @@ func closesSettings() Settings {
 			"cash": "1000",
 			"card": "1360",
 		},
-		KontoGutschein: "1796",
-		KontoTrinkgeld: "1363",
+		KontoGutschein:        "1796",
+		KontoGutscheinZahlung: "1360", // the reference day's voucher was card-paid: proceeds landed in Geldtransit
+		KontoGeldtransit:      "1360", // skim destination: Geldtransit, per the reference's "Abschoepfung Kasse" row
+		KontoTrinkgeld:        "1363",
 		Erloeskonten: map[string]string{
 			"1900": "8400",
 			"700":  "8300",
@@ -30,16 +33,17 @@ func closesSettings() Settings {
 	}
 }
 
-// referenceDayClose is ut-docs#1005's reference day, MINUS its voucher row:
-// EODReport.VouchersIssued carries no payment-method breakdown, and with
-// more than one configured method BuildFromCloses refuses (rather than
-// guesses) which Konto to debit for it — so the full 7-row reference day
-// cannot be produced in one batch with both cash and card configured. The
-// voucher row is reproduced exactly in
-// TestBuildFromCloses_GoldenVoucherRow_SingleConfiguredMethod, where the
-// single-configured-method rule resolves it unambiguously. See
-// TestBuildFromCloses_VouchersAmbiguousWithMultipleMethods_Refuses for the
-// refusal itself.
+// referenceDayClose is ut-docs#1005's FULL reference day — all seven
+// reference rows, voucher issuance included: with the dedicated
+// datev_konto_gutschein_zahlung / datev_konto_geldtransit settings naming
+// the voucher-proceeds and skim-destination accounts directly, an ordinary
+// cash+card day that also sold a voucher builds in one batch (an earlier
+// draft inferred both accounts from datev_konten_by_method's cardinality
+// and could only manage 6 of the 7 rows).
+//
+// Gross is the Z-report's own headline figure: the cross-tab cells' gross
+// total (121040) plus VouchersIssued (1500) — vouchers are inside the sale
+// total but outside every per-rate band, per the host's EODReport doc.
 func referenceDayClose() EODCloseExport {
 	return EODCloseExport{
 		ZNumber: 17,
@@ -51,6 +55,8 @@ func referenceDayClose() EODCloseExport {
 				{Method: "card", RateBP: 1900, Net: 8008, Tax: 1522, Gross: 9530},
 				{Method: "cash", RateBP: 1900, Net: 7084, Tax: 1346, Gross: 8430},
 			},
+			Gross:              122540,
+			VouchersIssued:     1500,
 			Tips:               []EODTip{{Method: "card", Count: 1, Amount: 320}},
 			CashReconciliation: &CashReconciliation{Skim: -41110},
 		},
@@ -81,12 +87,18 @@ func bookingTuples(t *testing.T, res *Result) [][8]string {
 	return out
 }
 
-// TestBuildFromCloses_GoldenReferenceDay reproduces ut-docs#1005's reference
-// table row for row (except the voucher row — see referenceDayClose's doc
-// comment): one row per (payment method x VAT rate) at gross, Konto by
-// method, Gegenkonto by rate, tip liability row, and the cash-skim credit
-// (H) row — all keyed to the close's own Z-number in Belegfeld 1, with
-// Festschreibung=1 (the archived close is immutable, per the ticket's rule).
+// TestBuildFromCloses_GoldenReferenceDay reproduces ALL SEVEN of
+// ut-docs#1005's reference rows in one batch (the ticket's own "Golden-file
+// test reproducing all seven reference rows" acceptance criterion): one row
+// per (payment method x VAT rate) at gross, Konto by method, Gegenkonto by
+// rate, the voucher-issuance liability row (debit
+// datev_konto_gutschein_zahlung, credit datev_konto_gutschein, labelled
+// "CARD" because 1360 is uniquely card's Konto), the tip liability row, and
+// the cash-skim credit (H) row into datev_konto_geldtransit — all keyed to
+// the close's own Z-number in Belegfeld 1, with Festschreibung=1 (the
+// archived close is immutable, per the ticket's rule). Row order is this
+// package's rendering order (cells, voucher, tips, skim), not the ticket
+// table's — the seven rows themselves match the reference exactly.
 func TestBuildFromCloses_GoldenReferenceDay(t *testing.T) {
 	now := time.Date(2026, 8, 22, 8, 0, 0, 0, time.UTC)
 	res, err := BuildFromCloses([]EODCloseExport{referenceDayClose()}, closesSettings(), now)
@@ -102,6 +114,7 @@ func TestBuildFromCloses_GoldenReferenceDay(t *testing.T) {
 		{"326,80", `"S"`, "1000", "8300", "2108", `"17"`, `"Erloese 7% CASH"`, "1"},
 		{"95,30", `"S"`, "1360", "8400", "2108", `"17"`, `"Erloese 19% CARD"`, "1"},
 		{"84,30", `"S"`, "1000", "8400", "2108", `"17"`, `"Erloese 19% CASH"`, "1"},
+		{"15,00", `"S"`, "1360", "1796", "2108", `"17"`, `"Aufbuchungen 0% CARD"`, "1"},
 		{"3,20", `"S"`, "1360", "1363", "2108", `"17"`, `"Trinkgeld CARD"`, "1"},
 		{"411,10", `"H"`, "1000", "1360", "2108", `"17"`, `"Abschoepfung Kasse"`, "1"},
 	}
@@ -116,15 +129,13 @@ func TestBuildFromCloses_GoldenReferenceDay(t *testing.T) {
 	}
 }
 
-// TestBuildFromCloses_GoldenVoucherRow_SingleConfiguredMethod reproduces the
-// one reference row TestBuildFromCloses_GoldenReferenceDay can't: with
-// exactly ONE configured payment method the voucher-issuance liability row
-// resolves unambiguously (Konto = that method's account, Gegenkonto =
-// KontoGutschein) and matches the ticket's "15,00 S 1360 1796 Aufbuchungen
-// 0% CARD" exactly.
-func TestBuildFromCloses_GoldenVoucherRow_SingleConfiguredMethod(t *testing.T) {
+// TestBuildFromCloses_VoucherRowLabel_NoUniqueMethodMatch pins the label
+// fallback: when datev_konto_gutschein_zahlung matches no configured
+// method's Konto (a dedicated voucher-proceeds account), the Buchungstext
+// is plain "Aufbuchungen 0%" — the booking itself is identical either way.
+func TestBuildFromCloses_VoucherRowLabel_NoUniqueMethodMatch(t *testing.T) {
 	s := closesSettings()
-	s.KonteByMethod = map[string]string{"card": "1360"}
+	s.KontoGutscheinZahlung = "1361" // matches neither cash (1000) nor card (1360)
 	close := EODCloseExport{
 		ZNumber: 18,
 		Report: EODReportForExport{
@@ -132,8 +143,7 @@ func TestBuildFromCloses_GoldenVoucherRow_SingleConfiguredMethod(t *testing.T) {
 			MethodTaxBands: []MethodTaxBand{
 				{Method: "card", RateBP: 1900, Net: 8008, Tax: 1522, Gross: 9530},
 			},
-			VouchersIssuedCount: 1,
-			VouchersIssued:      1500,
+			VouchersIssued: 1500,
 		},
 	}
 	res, err := BuildFromCloses([]EODCloseExport{close}, s, time.Now().UTC())
@@ -143,7 +153,7 @@ func TestBuildFromCloses_GoldenVoucherRow_SingleConfiguredMethod(t *testing.T) {
 	got := bookingTuples(t, res)
 	want := [][8]string{
 		{"95,30", `"S"`, "1360", "8400", "2208", `"18"`, `"Erloese 19% CARD"`, "1"},
-		{"15,00", `"S"`, "1360", "1796", "2208", `"18"`, `"Aufbuchungen 0% CARD"`, "1"},
+		{"15,00", `"S"`, "1361", "1796", "2208", `"18"`, `"Aufbuchungen 0%"`, "1"},
 	}
 	if len(got) != len(want) {
 		t.Fatalf("expected %d rows, got %d: %v", len(want), len(got), got)
@@ -155,14 +165,18 @@ func TestBuildFromCloses_GoldenVoucherRow_SingleConfiguredMethod(t *testing.T) {
 	}
 }
 
-// TestBuildFromCloses_ReconcilesToZReport is the ut-docs#1005 AC "row total
-// equals the day-close gross" — the same identity spirit as ut-docs#1004's
-// assertEODMethodTaxBandIdentities, asserted on the generated batch itself:
-// the signed sum of the Erloes cell rows reconstructs the close's own
-// MethodTaxBands total gross, and every other figure (tips, skim) is
-// reproduced exactly, so the whole batch reconstructs the Z-report by
-// construction.
-func TestBuildFromCloses_ReconcilesToZReport(t *testing.T) {
+// TestBuildFromCloses_ReconcilesToZReportGross is the ut-docs#1005 AC "row
+// total equals the day-close gross", asserted as a genuine identity against
+// the Z-report's OWN headline Gross figure (not just against a re-sum of
+// the same cells the rows were rendered from): per the host's EODReport
+// definition, Gross includes voucher issuance (a 0% liability inside the
+// sale total) but never tips, so
+//
+//	sum(Erloes rows) + voucher-issuance row == Report.Gross
+//
+// while tips and skim are each reproduced exactly and the whole batch's
+// signed total is Gross + tips + skim.
+func TestBuildFromCloses_ReconcilesToZReportGross(t *testing.T) {
 	close := referenceDayClose()
 	res, err := BuildFromCloses([]EODCloseExport{close}, closesSettings(), time.Now().UTC())
 	if err != nil {
@@ -181,7 +195,7 @@ func TestBuildFromCloses_ReconcilesToZReport(t *testing.T) {
 		return euros*100 + cents
 	}
 
-	var erloesSum, tipSum, skimSum, signedTotal int64
+	var erloesSum, voucherSum, tipSum, skimSum, signedTotal int64
 	for _, row := range bookingTuples(t, res) {
 		amount := parseAmount(row[0])
 		signed := amount
@@ -192,6 +206,8 @@ func TestBuildFromCloses_ReconcilesToZReport(t *testing.T) {
 		switch {
 		case strings.HasPrefix(row[6], `"Erloese `):
 			erloesSum += signed
+		case strings.HasPrefix(row[6], `"Aufbuchungen `):
+			voucherSum += signed
 		case strings.HasPrefix(row[6], `"Trinkgeld `):
 			tipSum += signed
 		case row[6] == `"Abschoepfung Kasse"`:
@@ -199,12 +215,8 @@ func TestBuildFromCloses_ReconcilesToZReport(t *testing.T) {
 		}
 	}
 
-	var wantGross int64
-	for _, cell := range close.Report.MethodTaxBands {
-		wantGross += cell.Gross
-	}
-	if erloesSum != wantGross {
-		t.Errorf("Erloes rows sum to %d, want the close's MethodTaxBands gross total %d", erloesSum, wantGross)
+	if got, want := erloesSum+voucherSum, close.Report.Gross; got != want {
+		t.Errorf("Erloes rows (%d) + voucher row (%d) sum to %d, want the Z-report's own Gross %d", erloesSum, voucherSum, got, want)
 	}
 	var wantTips int64
 	for _, tip := range close.Report.Tips {
@@ -216,8 +228,8 @@ func TestBuildFromCloses_ReconcilesToZReport(t *testing.T) {
 	if skimSum != close.Report.CashReconciliation.Skim {
 		t.Errorf("skim row signed sum is %d, want %d (the recorded negative skim)", skimSum, close.Report.CashReconciliation.Skim)
 	}
-	if want := wantGross + wantTips + close.Report.CashReconciliation.Skim; signedTotal != want {
-		t.Errorf("whole batch signed total is %d, want %d (gross + tips + skim)", signedTotal, want)
+	if want := close.Report.Gross + wantTips + close.Report.CashReconciliation.Skim; signedTotal != want {
+		t.Errorf("whole batch signed total is %d, want %d (Gross + tips + skim)", signedTotal, want)
 	}
 }
 
@@ -315,13 +327,16 @@ func TestBuildFromCloses_TipsWithoutKontoTrinkgeld_Refuses(t *testing.T) {
 	}
 }
 
-// Unset-but-unneeded liability Gegenkonten are fine: a close with no tips,
-// no vouchers and no skim must build with only KonteByMethod/Erloeskonten
-// configured (empty+unused is fine; empty+needed is the hard refuse).
+// Unset-but-unneeded liability/transit Konten are fine: a close with no
+// tips, no vouchers and no skim must build with only KonteByMethod/
+// Erloeskonten configured (empty+unused is fine; empty+needed is the hard
+// refuse).
 func TestBuildFromCloses_UnusedLiabilityKontenMayStayEmpty(t *testing.T) {
 	s := closesSettings()
 	s.KontoTrinkgeld = ""
 	s.KontoGutschein = ""
+	s.KontoGutscheinZahlung = ""
+	s.KontoGeldtransit = ""
 	close := EODCloseExport{
 		ZNumber: 30,
 		Report: EODReportForExport{
@@ -336,39 +351,30 @@ func TestBuildFromCloses_UnusedLiabilityKontenMayStayEmpty(t *testing.T) {
 
 func TestBuildFromCloses_VouchersWithoutKontoGutschein_Refuses(t *testing.T) {
 	s := closesSettings()
-	s.KonteByMethod = map[string]string{"card": "1360"} // single method, so only the missing Gegenkonto can refuse
 	s.KontoGutschein = ""
-	close := EODCloseExport{
-		ZNumber: 31,
-		Report: EODReportForExport{
-			Day:            "2026-08-23",
-			MethodTaxBands: []MethodTaxBand{{Method: "card", RateBP: 1900, Net: 100, Tax: 19, Gross: 119}},
-			VouchersIssued: 1500, VouchersIssuedCount: 1,
-		},
-	}
-	_, err := BuildFromCloses([]EODCloseExport{close}, s, time.Now())
+	_, err := BuildFromCloses([]EODCloseExport{referenceDayClose()}, s, time.Now())
 	if err == nil {
 		t.Fatal("expected error: the close issued vouchers but datev_konto_gutschein is unset")
 	}
-	if !strings.Contains(err.Error(), "gutschein") {
+	if !strings.Contains(err.Error(), "datev_konto_gutschein is not configured") {
 		t.Fatalf("error should name the missing setting, got: %v", err)
 	}
 }
 
-// TestBuildFromCloses_VouchersAmbiguousWithMultipleMethods_Refuses pins the
-// documented limitation: EODReport.VouchersIssued is a day total with no
-// payment-method dimension, so with more than one configured method the
-// Konto to debit is genuinely ambiguous — refuse, never guess a method.
-func TestBuildFromCloses_VouchersAmbiguousWithMultipleMethods_Refuses(t *testing.T) {
-	close := referenceDayClose()
-	close.Report.VouchersIssued = 1500
-	close.Report.VouchersIssuedCount = 1
-	_, err := BuildFromCloses([]EODCloseExport{close}, closesSettings(), time.Now())
+// TestBuildFromCloses_VouchersWithoutKontoGutscheinZahlung_Refuses:
+// EODReport.VouchersIssued is a day total with no payment-method dimension,
+// so the Konto the proceeds landed on must be named directly by
+// datev_konto_gutschein_zahlung — with it unset the export refuses, never
+// inferring an account from datev_konten_by_method (whatever its size).
+func TestBuildFromCloses_VouchersWithoutKontoGutscheinZahlung_Refuses(t *testing.T) {
+	s := closesSettings()
+	s.KontoGutscheinZahlung = ""
+	_, err := BuildFromCloses([]EODCloseExport{referenceDayClose()}, s, time.Now())
 	if err == nil {
-		t.Fatal("expected error: vouchers issued with >1 configured payment method is ambiguous")
+		t.Fatal("expected error: vouchers issued but datev_konto_gutschein_zahlung is unset")
 	}
-	if !strings.Contains(err.Error(), "voucher") {
-		t.Fatalf("error should explain the voucher ambiguity, got: %v", err)
+	if !strings.Contains(err.Error(), "datev_konto_gutschein_zahlung") {
+		t.Fatalf("error should name the missing setting, got: %v", err)
 	}
 }
 
@@ -392,19 +398,108 @@ func TestBuildFromCloses_SkimWithoutCashKonto_Refuses(t *testing.T) {
 	}
 }
 
-// Same ambiguity rule as vouchers, on the skim's Gegenkonto: with two
-// non-cash methods configured there is no way to know which transit account
-// the skimmed cash goes to — refuse, never guess.
-func TestBuildFromCloses_SkimAmbiguousWithMultipleNonCashMethods_Refuses(t *testing.T) {
+// Same rule as vouchers, on the skim's Gegenkonto: the destination
+// (transit/safe) account is named directly by datev_konto_geldtransit —
+// with it unset and a nonzero skim in range the export refuses, never
+// inferring the account from which non-cash methods happen to be
+// configured.
+func TestBuildFromCloses_SkimWithoutKontoGeldtransit_Refuses(t *testing.T) {
 	s := closesSettings()
-	s.KonteByMethod["voucher"] = "1361"
-	close := referenceDayClose()
-	_, err := BuildFromCloses([]EODCloseExport{close}, s, time.Now())
+	s.KontoGeldtransit = ""
+	_, err := BuildFromCloses([]EODCloseExport{referenceDayClose()}, s, time.Now())
 	if err == nil {
-		t.Fatal("expected error: nonzero skim with >1 configured non-cash method is ambiguous")
+		t.Fatal("expected error: nonzero skim but datev_konto_geldtransit is unset")
 	}
-	if !strings.Contains(err.Error(), "skim") && !strings.Contains(err.Error(), "Abschoepfung") {
-		t.Fatalf("error should explain the skim ambiguity, got: %v", err)
+	if !strings.Contains(err.Error(), "datev_konto_geldtransit") {
+		t.Fatalf("error should name the missing setting, got: %v", err)
+	}
+}
+
+// TestBuildFromCloses_PositiveSkim_Refuses: a skim is stored negative (cash
+// removed from the drawer) and the shifts API refuses to record a positive
+// one — a positive value here means corrupt or hand-edited archive data, so
+// it refuses like the negative-tip/negative-cell checks (defense in depth).
+func TestBuildFromCloses_PositiveSkim_Refuses(t *testing.T) {
+	close := referenceDayClose()
+	close.Report.CashReconciliation.Skim = 5000
+	_, err := BuildFromCloses([]EODCloseExport{close}, closesSettings(), time.Now())
+	if err == nil {
+		t.Fatal("expected error for a positive skim, got nil")
+	}
+	if !strings.Contains(err.Error(), "positive cash skim") {
+		t.Fatalf("error should name the positive skim, got: %v", err)
+	}
+}
+
+// TestBuildFromCloses_NormalCashCardVoucherDay is B3's regression test
+// (independent review of ut-docs#1005): an ordinary pilot-shop
+// configuration — cash + card + a third tender ("giro", chosen to sort
+// AFTER "cash" so no revived sorted-slice-[0] pattern could pass by
+// accident) — that sells a gift voucher AND skims the drawer on the same
+// day must build, because the voucher-proceeds and skim-destination
+// accounts come from their own dedicated settings, not from
+// datev_konten_by_method's cardinality. An earlier draft refused this
+// entire batch.
+func TestBuildFromCloses_NormalCashCardVoucherDay(t *testing.T) {
+	s := closesSettings()
+	s.KonteByMethod = map[string]string{
+		"cash": "1000",
+		"card": "1360",
+		"giro": "1362",
+	}
+	s.KontoGutscheinZahlung = "1360"
+	s.KontoGeldtransit = "1370"
+	close := EODCloseExport{
+		ZNumber: 40,
+		Report: EODReportForExport{
+			Day: "2026-08-24",
+			MethodTaxBands: []MethodTaxBand{
+				{Method: "cash", RateBP: 1900, Net: 100, Tax: 19, Gross: 119},
+				{Method: "card", RateBP: 1900, Net: 200, Tax: 38, Gross: 238},
+				{Method: "giro", RateBP: 700, Net: 300, Tax: 21, Gross: 321},
+			},
+			Gross:              2178, // 678 cells + 1500 vouchers
+			VouchersIssued:     1500,
+			CashReconciliation: &CashReconciliation{Skim: -100},
+		},
+	}
+	res, err := BuildFromCloses([]EODCloseExport{close}, s, time.Now().UTC())
+	if err != nil {
+		t.Fatalf("a normal cash+card(+giro) voucher day must build with the dedicated settings, got: %v", err)
+	}
+	got := bookingTuples(t, res)
+	want := [][8]string{
+		{"1,19", `"S"`, "1000", "8400", "2408", `"40"`, `"Erloese 19% CASH"`, "1"},
+		{"2,38", `"S"`, "1360", "8400", "2408", `"40"`, `"Erloese 19% CARD"`, "1"},
+		{"3,21", `"S"`, "1362", "8300", "2408", `"40"`, `"Erloese 7% GIRO"`, "1"},
+		{"15,00", `"S"`, "1360", "1796", "2408", `"40"`, `"Aufbuchungen 0% CARD"`, "1"},
+		{"1,00", `"H"`, "1000", "1370", "2408", `"40"`, `"Abschoepfung Kasse"`, "1"},
+	}
+	if len(got) != len(want) {
+		t.Fatalf("expected %d rows, got %d: %v", len(want), len(got), got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("row %d:\n got  %v\n want %v", i, got[i], want[i])
+		}
+	}
+}
+
+// TestBuildFromCloses_AllClosesEmpty_Refuses closes the header-only-file
+// hole the len(closes)==0 check alone leaves open: a range containing only
+// genuinely zero-trading closed days (empty cross-tab, no tips, no
+// vouchers, no skim) renders zero booking rows and must refuse, not return
+// an apparently-successful 2-line file.
+func TestBuildFromCloses_AllClosesEmpty_Refuses(t *testing.T) {
+	empty := func(z int64, day string) EODCloseExport {
+		return EODCloseExport{ZNumber: z, Report: EODReportForExport{Day: day}}
+	}
+	_, err := BuildFromCloses([]EODCloseExport{empty(50, "2026-08-25"), empty(51, "2026-08-26")}, closesSettings(), time.Now())
+	if err == nil {
+		t.Fatal("expected error for a range of zero-activity closes, got nil (a header-only file would look like a successful export)")
+	}
+	if !strings.Contains(err.Error(), "no postings") || !strings.Contains(err.Error(), "2026-08-25") || !strings.Contains(err.Error(), "2026-08-26") {
+		t.Fatalf("error should say no postings and name the range, got: %v", err)
 	}
 }
 
@@ -438,6 +533,19 @@ func TestBuildFromCloses_MethodKontoNotDigits_Refuses(t *testing.T) {
 	s.KonteByMethod["card"] = "1360;DROP"
 	if _, err := BuildFromCloses([]EODCloseExport{referenceDayClose()}, s, time.Now()); err == nil {
 		t.Fatal("expected error for a non-digit method Konto, got nil")
+	}
+}
+
+func TestBuildFromCloses_DedicatedKontenNotDigits_Refuse(t *testing.T) {
+	s := closesSettings()
+	s.KontoGutscheinZahlung = "1360;DROP"
+	if _, err := BuildFromCloses([]EODCloseExport{referenceDayClose()}, s, time.Now()); err == nil {
+		t.Fatal("expected error for a non-digit datev_konto_gutschein_zahlung, got nil")
+	}
+	s = closesSettings()
+	s.KontoGeldtransit = "1370;DROP"
+	if _, err := BuildFromCloses([]EODCloseExport{referenceDayClose()}, s, time.Now()); err == nil {
+		t.Fatal("expected error for a non-digit datev_konto_geldtransit, got nil")
 	}
 }
 

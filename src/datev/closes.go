@@ -44,13 +44,20 @@ type EODReportForExport struct {
 	// Tips by payment method, held out of revenue (ut-docs#1007) — posted
 	// to the tip liability account, never a revenue account.
 	Tips []EODTip `json:"tips"`
+	// Gross is the Z-report's own day total (minor units) — per the host's
+	// EODReport definition it includes voucher issuance (a 0% liability
+	// inside the sale total) but never tips (held out of revenue). Carried
+	// so a generated batch can be checked against the Z-report's headline
+	// figure: sum(Erloes rows) + VouchersIssued == Gross (pinned by
+	// TestBuildFromCloses_ReconcilesToZReportGross).
+	Gross int64 `json:"gross"`
 	// VouchersIssued is the day's voucher-issuance total (minor units) —
-	// a liability (§3 Abs. 13 UStG), not revenue. NOTE: it carries NO
-	// payment-method breakdown (a day total), which is why BuildFromCloses
-	// refuses when more than one payment method is configured — see the
-	// voucher validation below.
-	VouchersIssuedCount int   `json:"vouchers_issued_count"`
-	VouchersIssued      int64 `json:"vouchers_issued"`
+	// a liability (§3 Abs. 13 UStG), not revenue. It carries NO
+	// payment-method breakdown (a day total), which is why the Konto the
+	// proceeds landed on is a dedicated setting
+	// (datev_konto_gutschein_zahlung), never inferred from
+	// datev_konten_by_method — see the voucher validation below.
+	VouchersIssued int64 `json:"vouchers_issued"`
 	// CashReconciliation carries the day's cash skim (stored negative —
 	// cash removed from the drawer). nil when no shift was closed that day.
 	CashReconciliation *CashReconciliation `json:"cash_reconciliation"`
@@ -84,15 +91,17 @@ type CashReconciliation struct {
 // ArchivedReportsInRange already orders by period). now is injected for
 // deterministic tests, same as Build.
 //
-// Known limitation, deliberate: EODReport.VouchersIssued and the cash
-// skim's destination carry no payment-method dimension, so when more than
-// one candidate account is configured (any second method for vouchers; a
-// second non-cash method for the skim's Gegenkonto) the account to post is
-// genuinely ambiguous and BuildFromCloses refuses with a clear error rather
-// than silently picking one — the same refuse-don't-guess stance as every
-// other unconfigured-account case in this package. Lifting it needs a
-// method-dimensioned voucher/skim breakdown on the Z-report itself
-// (host-side), not a guess here.
+// EODReport.VouchersIssued and the cash skim's destination carry no
+// payment-method dimension, so the accounts they post to are named
+// DIRECTLY by two dedicated settings — datev_konto_gutschein_zahlung (the
+// Konto the voucher-sale proceeds landed on) and datev_konto_geldtransit
+// (the skim's transit/safe Gegenkonto) — never inferred from how many
+// entries datev_konten_by_method happens to have (an earlier draft did
+// exactly that, and refused a whole multi-day batch for an ordinary
+// cash+card shop the moment one gift voucher was sold). When a close needs
+// one of these rows and its setting is unset, BuildFromCloses refuses with
+// a clear error — the same refuse-don't-guess stance as every other
+// unconfigured-account case in this package.
 func BuildFromCloses(closes []EODCloseExport, settings Settings, now time.Time) (*Result, error) {
 	sachkontenLaenge, wjBeginn, err := commonSettingsChecks(settings)
 	if err != nil {
@@ -109,6 +118,12 @@ func BuildFromCloses(closes []EODCloseExport, settings Settings, now time.Time) 
 	if k := strings.TrimSpace(settings.KontoTrinkgeld); k != "" && !isDigits(k) {
 		return nil, fmt.Errorf("datev export: datev_konto_trinkgeld must be digits only, got %q", settings.KontoTrinkgeld)
 	}
+	if k := strings.TrimSpace(settings.KontoGutscheinZahlung); k != "" && !isDigits(k) {
+		return nil, fmt.Errorf("datev export: datev_konto_gutschein_zahlung must be digits only, got %q", settings.KontoGutscheinZahlung)
+	}
+	if k := strings.TrimSpace(settings.KontoGeldtransit); k != "" && !isDigits(k) {
+		return nil, fmt.Errorf("datev export: datev_konto_geldtransit must be digits only, got %q", settings.KontoGeldtransit)
+	}
 	if len(closes) == 0 {
 		// Same reasoning as Build's no-sales refusal: a header-only file
 		// would look like a successful export. The likely causes differ
@@ -120,22 +135,6 @@ func BuildFromCloses(closes []EODCloseExport, settings Settings, now time.Time) 
 	kontoFor := func(method string) (string, bool) {
 		k := strings.TrimSpace(settings.KonteByMethod[method])
 		return k, k != ""
-	}
-	// Configured methods (non-blank Konto), for the voucher/skim ambiguity
-	// rules — sorted so error messages and the single-method pick are
-	// deterministic regardless of map iteration order.
-	var configuredMethods []string
-	for method, konto := range settings.KonteByMethod {
-		if strings.TrimSpace(konto) != "" {
-			configuredMethods = append(configuredMethods, method)
-		}
-	}
-	sort.Strings(configuredMethods)
-	var nonCashMethods []string
-	for _, m := range configuredMethods {
-		if m != "cash" {
-			nonCashMethods = append(nonCashMethods, m)
-		}
 	}
 
 	// Validate EVERY close up front, before rendering anything — a partial
@@ -197,23 +196,32 @@ func BuildFromCloses(closes []EODCloseExport, settings Settings, now time.Time) 
 			if strings.TrimSpace(settings.KontoGutschein) == "" {
 				addProblem("%s has vouchers issued but datev_konto_gutschein is not configured", closeName)
 			}
-			if len(configuredMethods) != 1 {
+			if strings.TrimSpace(settings.KontoGutscheinZahlung) == "" {
 				// See the function doc comment: VouchersIssued is a day
-				// total with no payment-method dimension, so with more than
-				// one configured method the Konto to debit is ambiguous.
-				addProblem("%s has vouchers issued, but the day total carries no payment-method breakdown and %d payment methods are configured (%s) — which Konto to debit is ambiguous; refusing rather than guessing (configure exactly one method, or export once the Z-report breaks vouchers down by method)", closeName, len(configuredMethods), strings.Join(configuredMethods, ", "))
+				// total with no payment-method dimension, so the Konto the
+				// proceeds landed on must be named directly — never
+				// inferred from datev_konten_by_method's entries.
+				addProblem("%s has vouchers issued but datev_konto_gutschein_zahlung is not configured — set it to the Konto the voucher-sale money landed on (the day total carries no payment-method breakdown, so it cannot be inferred)", closeName)
 			}
 		}
 		if c.Report.CashReconciliation != nil && c.Report.CashReconciliation.Skim != 0 {
+			if c.Report.CashReconciliation.Skim > 0 {
+				// A skim is stored negative (cash removed from the drawer);
+				// the shifts API refuses to record a positive one, so a
+				// positive value here means corrupt or hand-edited archive
+				// data — refuse like the negative-tip/negative-cell checks,
+				// never book a credit row from a value with the wrong sign.
+				addProblem("%s: positive cash skim (%d) — a skim is stored negative (cash removed from the drawer); refusing rather than misbooking it", closeName, c.Report.CashReconciliation.Skim)
+			}
 			if _, ok := kontoFor("cash"); !ok {
 				addProblem("%s has a cash skim but datev_konten_by_method has no \"cash\" Konto configured", closeName)
 			}
-			if len(nonCashMethods) != 1 {
-				// Same ambiguity shape as vouchers, on the credit side: the
-				// skim's destination (transit) account is the single
-				// configured non-cash method's Konto; with zero or several
-				// there is nothing unambiguous to post.
-				addProblem("%s has a cash skim, but its destination account is ambiguous: expected exactly one configured non-cash method as the transit account, found %d (%s) — refusing rather than guessing", closeName, len(nonCashMethods), strings.Join(nonCashMethods, ", "))
+			if strings.TrimSpace(settings.KontoGeldtransit) == "" {
+				// Same shape as vouchers, on the credit side: the skim's
+				// destination (transit/safe) account is named directly by
+				// its own setting, never inferred from which non-cash
+				// methods happen to be configured.
+				addProblem("%s has a cash skim but datev_konto_geldtransit is not configured — set it to the transit/safe account the skimmed cash moves into", closeName)
 			}
 		}
 	}
@@ -248,6 +256,7 @@ func BuildFromCloses(closes []EODCloseExport, settings Settings, now time.Time) 
 	sb.WriteString("\r\n")
 	sb.WriteString(header2Columns)
 	sb.WriteString("\r\n")
+	renderedRows := 0
 	for _, c := range closes {
 		day, _ := time.Parse("2006-01-02", c.Report.Day)
 		belegdatum := day.Format("0201")
@@ -262,18 +271,28 @@ func BuildFromCloses(closes []EODCloseExport, settings Settings, now time.Time) 
 			if settings.BuSchluessel != nil {
 				buSchluessel = settings.BuSchluessel[rateKey]
 			}
-			sb.WriteString(closeBookingRow(cell.Gross, "S", konto, settings.Erloeskonten[rateKey], buSchluessel,
+			sb.WriteString(closeBookingRow(cell.Gross, "S", konto, strings.TrimSpace(settings.Erloeskonten[rateKey]), buSchluessel,
 				belegdatum, belegfeld1, fmt.Sprintf("Erloese %s%% %s", rateText(cell.RateBP), strings.ToUpper(cell.Method))))
 			sb.WriteString("\r\n")
+			renderedRows++
 		}
 		// Voucher issuance: a 0% liability (Gegenkonto KontoGutschein), not
-		// revenue. The single-configured-method rule above already resolved
-		// which Konto the money landed on.
+		// revenue. The Konto the proceeds landed on is the dedicated
+		// datev_konto_gutschein_zahlung setting (validated non-empty above).
+		// When that account is unambiguously one configured method's Konto,
+		// the Buchungstext carries that method's name (the reference batch's
+		// "Aufbuchungen 0% CARD"); a purely-labelling nicety — the booking
+		// itself never depends on the lookup.
 		if c.Report.VouchersIssued != 0 {
-			konto, _ := kontoFor(configuredMethods[0])
+			konto := strings.TrimSpace(settings.KontoGutscheinZahlung)
+			text := "Aufbuchungen 0%"
+			if method, ok := uniqueMethodForKonto(settings.KonteByMethod, konto); ok {
+				text += " " + strings.ToUpper(method)
+			}
 			sb.WriteString(closeBookingRow(c.Report.VouchersIssued, "S", konto, strings.TrimSpace(settings.KontoGutschein), "",
-				belegdatum, belegfeld1, fmt.Sprintf("Aufbuchungen 0%% %s", strings.ToUpper(configuredMethods[0]))))
+				belegdatum, belegfeld1, text))
 			sb.WriteString("\r\n")
+			renderedRows++
 		}
 		// Tips: liability (Gegenkonto KontoTrinkgeld), never revenue.
 		for _, tip := range c.Report.Tips {
@@ -284,17 +303,28 @@ func BuildFromCloses(closes []EODCloseExport, settings Settings, now time.Time) 
 			sb.WriteString(closeBookingRow(tip.Amount, "S", konto, strings.TrimSpace(settings.KontoTrinkgeld), "",
 				belegdatum, belegfeld1, fmt.Sprintf("Trinkgeld %s", strings.ToUpper(tip.Method))))
 			sb.WriteString("\r\n")
+			renderedRows++
 		}
 		// Cash skim: the one credit (H) row — cash out of the drawer into
-		// the (single) transit account, restoring the float. Skim is stored
-		// negative; the Umsatz column is unsigned, sign rides on S/H.
+		// the transit/safe account named by datev_konto_geldtransit
+		// (validated non-empty above), restoring the float. The debit side
+		// stays the configured "cash" Konto. Skim is stored negative; the
+		// Umsatz column is unsigned, sign rides on S/H.
 		if c.Report.CashReconciliation != nil && c.Report.CashReconciliation.Skim != 0 {
 			cashKonto, _ := kontoFor("cash")
-			transitKonto, _ := kontoFor(nonCashMethods[0])
-			sb.WriteString(closeBookingRow(c.Report.CashReconciliation.Skim, "H", cashKonto, transitKonto, "",
+			sb.WriteString(closeBookingRow(c.Report.CashReconciliation.Skim, "H", cashKonto, strings.TrimSpace(settings.KontoGeldtransit), "",
 				belegdatum, belegfeld1, "Abschoepfung Kasse"))
 			sb.WriteString("\r\n")
+			renderedRows++
 		}
+	}
+	if renderedRows == 0 {
+		// Same reasoning as the len(closes)==0 refusal above, reached the
+		// other way: every close in range was economically empty (a genuine
+		// zero-trading day that still got closed), so the file would be
+		// header-only — an apparently-successful export with zero booking
+		// rows. Mirror Build's no-sales refusal rather than return it.
+		return nil, fmt.Errorf("datev export: no postings for %s to %s — every close in range had zero trading activity", closes[0].Report.Day, closes[len(closes)-1].Report.Day)
 	}
 
 	return &Result{
@@ -323,6 +353,25 @@ func closeBookingRow(amountMinor int64, sollHaben, konto, gegenkonto, buSchluess
 	fields[13] = q(truncate(buchungstext, 60))
 	fields[113] = "1" // Festschreibung
 	return strings.Join(fields, ";")
+}
+
+// uniqueMethodForKonto returns the one payment method whose configured
+// Konto equals konto, when exactly one does — used ONLY to label the
+// voucher-issuance row's Buchungstext (e.g. "Aufbuchungen 0% CARD" when
+// datev_konto_gutschein_zahlung is card's own Geldtransit account). With
+// zero or several matching methods it reports false and the label stays
+// method-less; the account booked never depends on this lookup.
+func uniqueMethodForKonto(konteByMethod map[string]string, konto string) (string, bool) {
+	var matches []string
+	for method, k := range konteByMethod {
+		if strings.TrimSpace(k) == konto {
+			matches = append(matches, method)
+		}
+	}
+	if len(matches) != 1 {
+		return "", false
+	}
+	return matches[0], true
 }
 
 // rateText renders a basis-point VAT rate as the reference table's percent

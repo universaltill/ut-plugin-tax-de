@@ -81,6 +81,19 @@ type Settings struct {
 	KontoKasse       string            // LEGACY, per-sale Build only: Konto debited for every booking row — superseded for the day-close batch (ut-docs#1005) by KonteByMethod; kept so Build (and any install still on the per-sale path) keeps refusing/working exactly as before
 	KonteByMethod    map[string]string // payment method id -> Konto the money landed on (e.g. {"cash":"1000","card":"1360"}) — no default, must cover every method present in the closes being exported (ut-docs#1005)
 	KontoGutschein   string            // voucher-issuance liability Gegenkonto (e.g. SKR03 1796) — no default; may stay empty until a close actually has vouchers issued
+	// KontoGutscheinZahlung is the DEBIT Konto for voucher-issuance proceeds
+	// (where the voucher-sale money landed, e.g. SKR03 1360 Geldtransit) —
+	// a dedicated setting because EODReport.VouchersIssued is a day total
+	// with no payment-method breakdown, so the account can never be inferred
+	// from KonteByMethod. No default; may stay empty until a close actually
+	// has vouchers issued.
+	KontoGutscheinZahlung string
+	// KontoGeldtransit is the cash skim's destination Gegenkonto (the
+	// transit/safe account the skimmed cash conceptually moves into, e.g.
+	// SKR03 1360) — dedicated for the same no-method-dimension reason as
+	// KontoGutscheinZahlung. No default; may stay empty until a close
+	// actually has a skim.
+	KontoGeldtransit string
 	KontoTrinkgeld   string            // tip liability Gegenkonto (e.g. SKR03 1363) — no default; may stay empty until a close actually has tips
 	Erloeskonten     map[string]string // tax_rate_bp (as decimal string) -> Gegenkonto (revenue account) — no default, must cover every rate present in the sales being exported
 	BuSchluessel     map[string]string // optional: tax_rate_bp -> BU-Schlüssel override; omitted/empty per rate means "Gegenkonto is already an Automatikkonto, no BU-Schlüssel needed" (the common SKR03/04 convention)

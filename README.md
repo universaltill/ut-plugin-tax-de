@@ -30,7 +30,7 @@ vs. "researched, not tested":
 | End-to-end behavior against the till's real event bus | **Partially verified, and now covered by a committed test suite** (`src/wasmrun`, 2026-08-19). The `fiscal.sign.ask` path is exercised against the REAL compiled `plugin.wasm` in a real wazero runtime (same engine `universal-till` uses) with stubbed host functions: event dispatch, settings lookup, the auth→start(`tx_revision=1`)→finish(`tx_revision=2`) call order, the exact money in the signed body, the full §6 evidence (RFC3339 timestamps, not raw epochs), and the exact stdout JSON for the approved path plus four failure paths (fiskaly 5xx, unconfigured, malformed payload, unbalanced receipt). Proven to bite: deleting the dispatch, dropping `tax` from the VAT gross, or answering `approved` without a signature each fail it. Still NOT proven: `universal-till`'s actual host-function implementations, a real installed-plugin flow through the till UI, and the HTTP layer here is a stub rather than live fiskaly — the two halves are each verified, their combination is not. |
 | DATEV EXTF file structure (31-field header row 1, 125-column header row 2, semicolon-delimited, Windows-1252, CRLF) | **Confirmed against a real reference file** (github.com/ledermann/datev's `EXTF_Buchungsstapel.csv`, byte-verified 2026-08-01), not reconstructed from memory — see `src/datev/datev.go`'s package doc comment. An independent review caught an early draft undercounting header row 1's trailing fields (27 vs. the real 31); fixed and pinned by `TestHeader1_FieldCount`. Unit-tested (`go test ./src/datev/...`), including a Windows-1252 round-trip check on the umlaut/en-dash header text. |
 | DATEV format-version numbers (`700`/`21`/`13`) and Soll/Haben booking convention (Kasse debited, Erlöskonto credited via an Automatikkonto, no BU-Schlüssel by default) | **Researched, not confirmed against DATEV's current published spec** (developer.datev.de 403'd when fetched) or a real accountant/DATEV import. Matches the reference file and common SKR03/04 practice, but NEEDS ACCOUNTANT VERIFICATION before a real filing. |
-| DATEV chart-of-accounts mapping (which Konto/Gegenkonto number per tax rate) | **Never guessed.** No default real account numbers anywhere in this plugin — `datev_konten_by_method`/`datev_erloeskonten`/`datev_konto_gutschein`/`datev_konto_trinkgeld` (and the legacy `datev_konto_kasse`) are merchant/accountant-configured settings; the export refuses (with a clear error) rather than emit an unconfigured, ambiguous or invented account number. |
+| DATEV chart-of-accounts mapping (which Konto/Gegenkonto number per tax rate) | **Never guessed.** No default real account numbers anywhere in this plugin — `datev_konten_by_method`/`datev_erloeskonten`/`datev_konto_gutschein`/`datev_konto_gutschein_zahlung`/`datev_konto_geldtransit`/`datev_konto_trinkgeld` (and the legacy `datev_konto_kasse`) are merchant/accountant-configured settings; the export refuses (with a clear error) rather than emit an unconfigured, ambiguous or invented account number. |
 
 ## What this plugin does
 
@@ -63,10 +63,14 @@ needed, ADR-0002's `tax`/`export` types already exist):
   keyed to the close's Z-number in Belegfeld 1 with `Festschreibung=1`.
   Because the input is the *already-archived, immutable* Z-report JSON, the
   batch reconciles to the Z-report by construction — it is never re-queried
-  from live sales. When the payload carries no `eod_closes` (an older host,
-  or a range with no archived close), the pre-v0.5.0 per-sale grain
-  (`datev.Build`, one row per sale × tax line against `datev_konto_kasse`,
-  ut-docs#221) still answers — see `src/main.go`'s routing comment.
+  from live sales. Routing is on the field's *presence*: a host that
+  supports `eod_closes` always sends it (`[]` when the range has no
+  archived close, in which case the export refuses with a clear
+  "close the day first" error rather than silently switching grain). Only
+  when the field is entirely absent (a pre-#1005 host that doesn't know
+  the concept) does the pre-v0.5.0 per-sale grain (`datev.Build`, one row
+  per sale × tax line against `datev_konto_kasse`, ut-docs#221) still
+  answer — see `src/main.go`'s routing comment.
 - **Dine-in/takeaway VAT rate switching (§12 UStG).** Subscribes to
   `tax.rate.ask` — a generic, blocking, value-returning hook
   (`EventBus.Ask`) universal-till's core added specifically so this rule
@@ -132,20 +136,21 @@ needed, ADR-0002's `tax`/`export` types already exist):
    granularity, but not exhaustively tested against every payment method
    string the till can produce.
 
-5. **The DATEV day-close export refuses two genuinely ambiguous postings
-   rather than guessing.** `EODReport.VouchersIssued` is a day total with
-   NO payment-method breakdown, so when vouchers were issued and more than
-   one payment method is configured in `datev_konten_by_method`, which
-   Konto to debit is unknowable — `BuildFromCloses` refuses with a clear
-   error (with exactly one configured method it resolves unambiguously).
-   The cash skim's destination account has the same shape: it's posted
-   against the *single* configured non-cash method's Konto, and refused
-   when there are zero or several. Lifting both needs a method-dimensioned
-   voucher/skim breakdown on the Z-report itself (host-side). Additionally,
-   the legacy per-sale fallback path (`datev.Build`, used only when the
-   host sends no `eod_closes`) still posts every sale to the single
-   `datev_konto_kasse`, ignoring payment method — that grain is superseded,
-   not fixed.
+5. **The voucher-proceeds and skim-destination accounts are dedicated
+   settings, not inferred.** `EODReport.VouchersIssued` is a day total with
+   NO payment-method breakdown, and the cash skim's destination has the
+   same shape — so the Konto the voucher-sale money landed on
+   (`datev_konto_gutschein_zahlung`) and the skim's transit/safe Gegenkonto
+   (`datev_konto_geldtransit`) are each named directly by their own
+   setting. When a close in the range needs one of those rows and its
+   setting is empty, `BuildFromCloses` refuses with a clear error — it
+   never infers an account from how many payment methods
+   `datev_konten_by_method` happens to configure (an earlier draft did, and
+   refused whole batches for ordinary cash+card shops the moment a voucher
+   was sold). Additionally, the legacy per-sale fallback path
+   (`datev.Build`, used only when the host sends no `eod_closes` field at
+   all) still posts every sale to the single `datev_konto_kasse`, ignoring
+   payment method — that grain is superseded, not fixed.
 
 6. **DATEV format-version numbers and the Soll/Haben booking convention are
    not confirmed against DATEV's current published spec or a live
@@ -328,12 +333,24 @@ independent of the wasm-level check.
   the money landed on, e.g. `{"cash": "1000", "card": "1360"}`. Required
   to cover every payment method that appears in the exported closes —
   export refuses and names the missing method(s) rather than guessing an
-  account number. (Replaced `datev_konto_kasse` in v0.5.0; the old key is
-  still read for the legacy per-sale fallback path, so an install that
-  configured it before upgrading keeps that path working.)
+  account number. (Superseded `datev_konto_kasse` for the day-close grain
+  in v0.5.0; the old key stays *declared in the manifest* and read for the
+  legacy per-sale fallback path — the till deletes any stored setting whose
+  key the manifest stops declaring, so removing the declaration would
+  silently destroy an upgraded install's configured value.)
 - `datev_konto_gutschein` — voucher-issuance liability Gegenkonto (e.g.
   SKR03 `1796`). No default; may stay empty until a close in the exported
   range actually issued vouchers, at which point export refuses without it.
+- `datev_konto_gutschein_zahlung` — the *debit* Konto for voucher-issuance
+  proceeds: where the voucher-sale money landed (e.g. SKR03 `1360`
+  Geldtransit if vouchers are card-paid). Needed because the Z-report's
+  voucher total carries no payment-method breakdown, so it can't be
+  inferred from `datev_konten_by_method`. Same empty-until-needed rule as
+  `datev_konto_gutschein`.
+- `datev_konto_geldtransit` — the cash skim's destination Gegenkonto (the
+  transit/safe account the skimmed cash moves into, e.g. SKR03 `1360`).
+  Empty-until-needed: export refuses when a close in range has a skim and
+  this is unset.
 - `datev_konto_trinkgeld` — tip liability Gegenkonto (e.g. SKR03 `1363`).
   Same empty-until-needed rule as `datev_konto_gutschein`.
 - `datev_erloeskonten` — JSON object, tax rate in basis points → Gegenkonto
@@ -361,12 +378,18 @@ filing):
 datev_erloeskonten:    {"700": "8300", "1900": "8400"}
 datev_konten_by_method: {"cash": "1000", "card": "1360"}
 datev_konto_gutschein: "1796"
+datev_konto_gutschein_zahlung: "1360"
+datev_konto_geldtransit: "1360"
 datev_konto_trinkgeld: "1363"
 ```
 
 (`8300` = Erlöse 7 % USt, `8400` = Erlöse 19 % USt, `1000` = Kasse,
 `1360` = Geldtransit, `1796`/`1363` = sonstige Verbindlichkeiten used for
-voucher/tip liabilities in the reference.)
+voucher/tip liabilities in the reference. `1360` doubles as the
+voucher-proceeds debit account and the skim destination in the reference
+day — card-paid vouchers and drawer cash both flow through Geldtransit;
+adjust either independently if the shop's accountant books them
+elsewhere.)
 
 **SKR04**: the equivalent accounts differ (SKR04 renumbers revenue into the
 4000s and cash/transit into the 1600s), and this plugin does not publish a
