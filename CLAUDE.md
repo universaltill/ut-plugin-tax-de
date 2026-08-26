@@ -215,10 +215,29 @@ context for whoever wires the dispatcher up.
 `export.requested.ask`, dispatched in `src/main.go` by `payload.EntryKey` —
 if you add a third export entry, extend that switch, don't just check
 against one constant again. Unlike DSFinV-K, the DATEV path needs no
-fiskaly account: it's pure local data transformation (`src/datev`) of the
-`sales[]` the host now sends in the payload (ut-docs#221) into a DATEV EXTF
-CSV, returned inline via `content_b64` — see README's "DATEV Buchungsstapel
-export" bullet and its Known gaps #5/#6.
+fiskaly account: it's pure local data transformation (`src/datev`),
+returned inline via `content_b64`. Since v0.5.0 (ut-docs#1005) the entry
+declares the `eod_closes` entity and the PREFERRED grain is
+`datev.BuildFromCloses`: one posting set per archived day-close the host
+sends in `eod_closes[]` — one row per (payment method x VAT rate) cell of
+that close's own cross-tab plus tip/voucher-liability and cash-skim rows,
+Belegfeld 1 = the close's Z-number, built from the ALREADY-ARCHIVED
+Z-report JSON so it reconciles to the Z-report by construction. Routing is
+on the field's PRESENCE, not its length: a supporting host always sends
+`eod_closes` (`[]` when the range holds no archived close — the export
+then refuses with a clear "close the day first" error, never silently
+switching grain); only a payload with the field entirely ABSENT (a
+pre-#1005 host) takes the legacy per-sale grain (`datev.Build` over
+`sales[]`, ut-docs#221) — see `src/main.go`'s routing comment before
+changing that fallback. The voucher-proceeds and skim-destination accounts
+are named directly by `datev_konto_gutschein_zahlung` /
+`datev_konto_geldtransit`, never inferred from `datev_konten_by_method`'s
+cardinality; and `datev_konto_kasse` must STAY declared in
+`manifest.json`'s `settings[]` even though superseded — the host's
+`ReconcilePluginSettings` deletes stored rows for undeclared keys on
+upgrade, which would destroy a merchant's configured value. See README's
+"DATEV Buchungsstapel export" bullet, its SKR03/SKR04 presets section, and
+Known gaps #5/#6/#7.
 
 ## Code layout
 
