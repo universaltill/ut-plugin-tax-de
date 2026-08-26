@@ -485,6 +485,54 @@ func TestBuildFromCloses_NormalCashCardVoucherDay(t *testing.T) {
 	}
 }
 
+// TestBuildFromCloses_ZeroGrossCell_SkippedNotBooked pins the fix for a
+// zero-Gross cross-tab cell: split-tender apportionment can floor a small
+// tender against a small band to exactly 0, and a same-day sale+return can
+// net a cell to exactly 0 too (neither is an error — negative cells are
+// refused separately). A zero cell must be skipped, not booked as a 0,00
+// Umsatz row (DATEV requires a positive amount per row), and must not count
+// toward renderedRows -- a close whose only cell is zero, with no other
+// activity, must still hit the AllClosesEmpty refusal, not silently pass it.
+func TestBuildFromCloses_ZeroGrossCell_SkippedNotBooked(t *testing.T) {
+	s := closesSettings()
+	close := EODCloseExport{
+		ZNumber: 60,
+		Report: EODReportForExport{
+			Day: "2026-08-24",
+			MethodTaxBands: []MethodTaxBand{
+				{Method: "cash", RateBP: 1900, Net: 0, Tax: 0, Gross: 0},
+				{Method: "card", RateBP: 1900, Net: 200, Tax: 38, Gross: 238},
+			},
+		},
+	}
+	res, err := BuildFromCloses([]EODCloseExport{close}, s, time.Now().UTC())
+	if err != nil {
+		t.Fatalf("a close with one zero cell and one real cell must build, got: %v", err)
+	}
+	got := bookingTuples(t, res)
+	if len(got) != 1 {
+		t.Fatalf("expected exactly 1 row (the zero cell skipped), got %d: %v", len(got), got)
+	}
+	if got[0][6] != `"Erloese 19% CARD"` {
+		t.Fatalf("expected the surviving row to be the card cell, got: %v", got[0])
+	}
+
+	// A close whose ONLY cell is zero, with nothing else, must still count
+	// as zero rendered rows -- the AllClosesEmpty refusal, not a silent
+	// header-only pass.
+	onlyZero := EODCloseExport{
+		ZNumber: 61,
+		Report: EODReportForExport{
+			Day:            "2026-08-25",
+			MethodTaxBands: []MethodTaxBand{{Method: "cash", RateBP: 1900, Net: 0, Tax: 0, Gross: 0}},
+		},
+	}
+	_, err = BuildFromCloses([]EODCloseExport{onlyZero}, s, time.Now().UTC())
+	if err == nil || !strings.Contains(err.Error(), "no postings") {
+		t.Fatalf("a close whose only cell is zero-Gross must refuse as no-postings, got: %v", err)
+	}
+}
+
 // TestBuildFromCloses_AllClosesEmpty_Refuses closes the header-only-file
 // hole the len(closes)==0 check alone leaves open: a range containing only
 // genuinely zero-trading closed days (empty cross-tab, no tips, no

@@ -263,8 +263,19 @@ func BuildFromCloses(closes []EODCloseExport, settings Settings, now time.Time) 
 		belegfeld1 := truncate(strconv.FormatInt(c.ZNumber, 10), 36)
 
 		// One row per (payment method x VAT rate) cell, gross, in the
-		// close's own cross-tab order.
+		// close's own cross-tab order. A zero-Gross cell is skipped, not
+		// booked: split-tender apportionment can floor a small tender
+		// against a small band to exactly 0 (internal/pages,
+		// apportionAmount's own doc comment notes the floor "can shift a
+		// minor unit between that sale's methods"), and a same-day
+		// sale+return can net a cell to exactly 0 too (negative cells are
+		// already refused above; exact-zero is not an error, just nothing
+		// to book). DATEV requires a positive Umsatz per row, and this
+		// also makes the renderedRows==0 refusal below mean what it says.
 		for _, cell := range c.Report.MethodTaxBands {
+			if cell.Gross == 0 {
+				continue
+			}
 			konto, _ := kontoFor(cell.Method)
 			rateKey := strconv.Itoa(cell.RateBP)
 			buSchluessel := ""
