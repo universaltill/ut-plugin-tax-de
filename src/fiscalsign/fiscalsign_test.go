@@ -45,6 +45,38 @@ func TestParseRequest_RealEnvelope(t *testing.T) {
 	}
 }
 
+// ut-docs#1404: sale_type (contract 1.6.0) must round-trip through
+// ParseRequest, and IsReturn must distinguish exactly "return" from
+// everything else — including the back-compat cases (field absent, or a
+// value that is neither "sale" nor "return") — treating all of them as an
+// ordinary sale, never erroring and never guessing "return".
+func TestParseRequest_SaleType(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		in         string
+		wantType   string
+		wantReturn bool
+	}{
+		{"return", `{"type":"fiscal.sign.ask","payload":{"sale_id":"x","sale_type":"return"}}`, "return", true},
+		{"sale", `{"type":"fiscal.sign.ask","payload":{"sale_id":"x","sale_type":"sale"}}`, "sale", false},
+		{"absent (pre-1.6.0 core)", `{"type":"fiscal.sign.ask","payload":{"sale_id":"x"}}`, "", false},
+		{"unrecognized value", `{"type":"fiscal.sign.ask","payload":{"sale_id":"x","sale_type":"void"}}`, "void", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req, err := ParseRequest([]byte(tc.in))
+			if err != nil {
+				t.Fatalf("ParseRequest: %v", err)
+			}
+			if req.SaleType != tc.wantType {
+				t.Errorf("SaleType = %q, want %q", req.SaleType, tc.wantType)
+			}
+			if got := req.IsReturn(); got != tc.wantReturn {
+				t.Errorf("IsReturn() = %v, want %v", got, tc.wantReturn)
+			}
+		})
+	}
+}
+
 func TestParseRequest_RetryFlag(t *testing.T) {
 	req, err := ParseRequest([]byte(`{"type":"fiscal.sign.ask","payload":{"sale_id":"x","retry":true}}`))
 	if err != nil {

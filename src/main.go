@@ -20,7 +20,18 @@
 //     SPECIAL_RATE_1 vat buckets, the RECEIPT_0104 return-receipt type, the
 //     deterministic-pseudo-UUID tx_id scheme) remain flagged "NEEDS SANDBOX
 //     VERIFICATION" below, same convention as ut-plugin-payment-sumup's
-//     unverified reader-checkout path.
+//     unverified reader-checkout path. Also unverified (ut-docs#1404,
+//     independent review): whether fiskaly expects a return's
+//     amounts_per_vat_rate/amounts_per_payment_type as the SAME positive
+//     magnitudes a sale would carry (distinguished purely by
+//     receipt_type=RECEIPT_0104) or as NEGATIVE amounts — this plugin sends
+//     positive magnitudes unconditionally either way (fiscalsign.VATAmounts/
+//     PaymentAmounts do not read sale_type at all), which is what core's own
+//     contract already sends (fiscal-sign-ask.md: "every amount in a return
+//     is the absolute value being handed back") — if fiskaly's schema
+//     actually wants a signed sign per receipt_type, this still records the
+//     return as positive turnover, exactly the outcome ut-docs#1203 exists
+//     to prevent, just mislabeled as RECEIPT_0104 instead of RECEIPT.
 //   - DSFinV-K export: still entirely unconfirmed — public docs describe it
 //     as possibly a genuinely separate API/host from SIGN DE (cash_register/
 //     cashPointClosing concepts), not just a different path on the same
@@ -534,8 +545,20 @@ func handleFiscalSignAsk(raw []byte) {
 		os.Exit(0)
 	}
 
+	// ut-docs#1404: signTransaction below has branched fiskaly's receipt_type
+	// on signInput.SaleType == "return" since before this change, but this
+	// construction never populated that field, so the branch was permanently
+	// dead: signInput.SaleType was always "", never "return", no matter what
+	// core sent. req.IsReturn() normalizes an absent/unrecognized value to
+	// "sale" behavior (contract back-compat), so this only ever sets
+	// "return" when core genuinely means it.
+	saleType := "sale"
+	if req.IsReturn() {
+		saleType = "return"
+	}
 	in := signInput{
 		SaleID:   req.SaleID,
+		SaleType: saleType,
 		VAT:      fiscalsign.VATAmounts(req),
 		Payments: fiscalsign.PaymentAmounts(req),
 	}

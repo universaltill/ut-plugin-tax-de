@@ -346,6 +346,69 @@ func TestFiscalSignAsk_ApprovedCarriesEvidence(t *testing.T) {
 	}
 }
 
+// ut-docs#1404: a "return" dispatch must sign distinguishably from a
+// "sale" dispatch of the same absolute amount — a signInput.SaleType field
+// already existed and signTransaction already branched fiskaly's
+// receipt_type on it (RECEIPT vs RECEIPT_0104), but nothing ever populated
+// it from the request, so the branch was permanently dead: every dispatch
+// signed as RECEIPT regardless of what core sent. This runs the compiled
+// plugin twice against otherwise-identical payloads (same money, same VAT
+// breakdown, same payment) differing only in sale_type, and asserts the
+// two signed request bodies actually differ on receipt_type.
+func TestFiscalSignAsk_ReturnSignsWithDistinctReceiptType(t *testing.T) {
+	wasm := buildWasm(t)
+
+	saleBody := ""
+	{
+		h := configuredHost(func(c httpCall) (int, string, bool) {
+			if strings.Contains(c.URL, "tx_revision=2") {
+				saleBody = c.Body()
+			}
+			return scriptedFiskaly(t)(c)
+		})
+		out, h := run(t, wasm, h, signAskEvent)
+		if s := statusOf(t, out, h); s != "approved" {
+			t.Fatalf("sale dispatch: status = %q, want approved", s)
+		}
+	}
+
+	returnEvent := strings.Replace(signAskEvent, `"sale_id": "sale-abc",`, `"sale_id": "return-abc", "sale_type": "return",`, 1)
+	returnBody := ""
+	{
+		h := configuredHost(func(c httpCall) (int, string, bool) {
+			if strings.Contains(c.URL, "tx_revision=2") {
+				returnBody = c.Body()
+			}
+			return scriptedFiskaly(t)(c)
+		})
+		out, h := run(t, wasm, h, returnEvent)
+		if s := statusOf(t, out, h); s != "approved" {
+			t.Fatalf("return dispatch: status = %q, want approved", s)
+		}
+	}
+
+	if saleBody == "" || returnBody == "" {
+		t.Fatalf("did not capture both finish bodies: sale=%q return=%q", saleBody, returnBody)
+	}
+	if !strings.Contains(saleBody, `"receipt_type":"RECEIPT"`) {
+		t.Errorf("sale dispatch: finish body missing receipt_type RECEIPT: %s", saleBody)
+	}
+	if strings.Contains(saleBody, "RECEIPT_0104") {
+		t.Errorf("sale dispatch must not use the return receipt type: %s", saleBody)
+	}
+	if !strings.Contains(returnBody, `"receipt_type":"RECEIPT_0104"`) {
+		t.Errorf("return dispatch: finish body missing receipt_type RECEIPT_0104 — sale_type was not threaded through (the ut-docs#1404 gap): %s", returnBody)
+	}
+	// Same money, same VAT/payment amounts either side — the only
+	// difference this test's two payloads carry is sale_type, so every
+	// amount in both signed bodies must be identical.
+	for _, want := range []string{`"amount":"8.33"`, `"amount":"5.35"`, `"amount":"13.68"`} {
+		if !strings.Contains(saleBody, want) || !strings.Contains(returnBody, want) {
+			t.Errorf("both bodies must carry the same amounts (only receipt_type should differ): sale=%s return=%s", saleBody, returnBody)
+		}
+	}
+}
+
 // Failure must be declared, never silently approved — core's whole
 // proceed-and-declare surface hangs off this answer.
 func TestFiscalSignAsk_UnreachableOnFiskalyFailure(t *testing.T) {

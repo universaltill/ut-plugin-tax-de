@@ -20,7 +20,8 @@
 //     VAT/payment bucket mapping below is fiskaly-shaped, and it is the
 //     part a second provider would replace.
 //
-// Contract: ut-docs/reference/contracts/fiscal-sign-ask.md v1.1.0.
+// Contract: ut-docs/reference/contracts/fiscal-sign-ask.md, tracking through
+// v1.6.0 (ut-docs#1203/#1404's sale_type field is the latest addition below).
 package fiscalsign
 
 import (
@@ -59,8 +60,8 @@ type VATLine struct {
 	Tax    int64 `json:"tax"`
 }
 
-// Request is the `fiscal.sign.ask` payload (contract v1.1.0). Money is in
-// integer minor units throughout.
+// Request is the `fiscal.sign.ask` payload (contract v1.1.0+, currently
+// tracking v1.6.0). Money is in integer minor units throughout.
 type Request struct {
 	SaleID       string    `json:"sale_id"`
 	Currency     string    `json:"currency"`
@@ -71,7 +72,22 @@ type Request struct {
 	// Retry marks a background re-attempt for a sale that already
 	// completed unsigned. The sale is committed; sign it as-is.
 	Retry bool `json:"retry"`
+	// SaleType (contract 1.6.0, ut-docs#1203/#1404) is "sale" | "return" —
+	// core sends it on every request as of 1.6.0, but this field is read
+	// defensively: an absent value (a pre-1.6.0 core, or a genuinely empty
+	// answer) is treated as "sale", the pre-1.6.0 behavior, never as an
+	// error. A refund/return must be signed/recorded as a Rückgabe, not as
+	// positive turnover — see main.go's signTransaction, which branches
+	// fiskaly's receipt_type on this field.
+	SaleType string `json:"sale_type"`
 }
+
+// IsReturn reports whether this request is for a refund/return, treating
+// anything other than the literal "return" (including the zero value, for
+// a pre-1.6.0 core or a malformed/omitted field) as an ordinary sale — the
+// back-compat default the contract requires (ut-docs#1404 acceptance
+// criteria: "no behavior change for a payload that omits the field").
+func (r Request) IsReturn() bool { return r.SaleType == "return" }
 
 // ParseRequest unwraps the event envelope core delivers on stdin
 // (`{"type":…,"payload":{…}}`, the same shape tax.rate.ask and
