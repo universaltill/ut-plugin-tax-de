@@ -253,10 +253,15 @@ Known gaps #5/#6/#7.
   no wasip1 tag, so `go test ./src/fiscalsign/...` runs on the host —
   `main.go` itself cannot be unit-tested at all (`//go:wasmimport`). Also
   the provider seam ADR-0055 requires: this is the fiskaly-shaped part a
-  future config-selected second provider would replace. **Two invariants
+  future config-selected second provider would replace. **Three invariants
   are pinned by tests and must not regress**: the amount signed per VAT
   bucket is GROSS (`net + tax`, not net — sending net under-declares every
-  sale), and a payment's tip is included in its signed total.
+  sale), a payment's tip is included in its signed total, and `sale_type`
+  ("sale"/"return", contract 1.6.0, ut-docs#1404) reaches `signTransaction`
+  and selects a distinct fiskaly `receipt_type` (`RECEIPT` vs
+  `RECEIPT_0104`) — the field existed and the branch was already written
+  before this repo's `sale_type` fix landed, but nothing populated it, so
+  it was silently dead until then.
 - `src/taxrate/` — the pure, host-independent half of the `tax.rate.ask`
   answerer (ut-docs#1013): the takeaway_rate_overrides lookup that
   produces Germany's (product tax class x consumption mode) VAT matrix.
