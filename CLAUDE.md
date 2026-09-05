@@ -274,6 +274,13 @@ Known gaps #5/#6/#7.
   the overrides JSON was last (re)serialized — same failure shape as the
   tax-code equal-pair bug fixed in ut-docs#536, generalized to this
   setting.
+- `src/auditkey/` — the pure, host-independent `tse_result:*` storage-key
+  derivation (ut-docs#1299). Same reason as `src/fiscalsign/`/`src/taxrate/`
+  — no wasip1 tag, so `go test ./src/auditkey/...` runs on the host.
+  `TSEResultKey` hashes a sale id into one of `RingSize` (256) fixed
+  buckets, so plugin storage from this source is capped forever instead
+  of growing one key per sale — see `recordResult`'s doc comment in
+  `main.go` and README's Known gap #8 for the full story.
 - `src/wasmrun/` — test-only. Runs the REAL compiled `plugin.wasm` through
   a real wazero runtime with stubbed host functions, asserting the
   `fiscal.sign.ask` request bodies and the exact stdout JSON for the

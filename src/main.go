@@ -96,6 +96,7 @@ import (
 	"time"
 	"unsafe"
 
+	"github.com/universaltill/ut-plugin-tax-de/src/auditkey"
 	"github.com/universaltill/ut-plugin-tax-de/src/datev"
 	"github.com/universaltill/ut-plugin-tax-de/src/fiscalsign"
 	"github.com/universaltill/ut-plugin-tax-de/src/fiskalyparse"
@@ -630,13 +631,40 @@ func handleTaxRateAsk(raw []byte) {
 	os.Exit(0)
 }
 
-// recordResult persists the sign attempt's outcome (signed or not) keyed by
-// sale id, so a future report/reconciliation surface can enumerate unsigned
-// sales. A permanent audit record. (It used to be contrasted with this
-// plugin's own transient retry queue; that queue was removed in v0.4.0 —
-// core owns retry now.)
+// recordResult persists the sign attempt's outcome (signed or not) into a
+// bounded, fixed-size ring of plugin-storage keys (auditkey.RingSize), so
+// a future report/reconciliation surface can inspect recent results. NOT
+// the system of record: core independently durably records EVERY outcome
+// via a different mechanism per branch — an approved sale's evidence
+// lands in core's own fiscal_tse_signatures table (ADR-0044,
+// RecordFiscalTSESignature, called from internal/pages/
+// fiscal_sign_hook.go's recordFiscalTSEEvidence), while a NOT-signed sale
+// gets a permanent unsigned_fiscal_signing/unsigned_fiscal_cannot_sign
+// audit-journal marker plus a receipt notice and operator alert
+// (declareUnsignedFiscalSale, same file) — and either way core already
+// owns the whole operator-facing failure surface via the fiscal.sign.ask
+// contract itself, independent of anything kept here. (It used to be
+// contrasted with this plugin's own transient retry queue; that queue
+// was removed in v0.4.0 — core owns retry now.)
+//
+// ut-docs#1299: this used to key by "tse_result:"+res.SaleID directly —
+// one NEW key per sale, forever, against core's 1024-key-per-plugin
+// StorageMaxKeys cap (internal/data/plugin_repo.go). A shop trading
+// steadily exhausted that cap within roughly a thousand sales, and the
+// only failure handling storagePut has is a log_write call that -- CONFIRMED
+// by reading internal/plugins/wasm_hostfns.go's hostLogWrite, not assumed
+// -- always maps to logging.L().Infof on the host side, which never
+// reaches the operator-visible Problems ring (internal/logging/logging.go
+// only surfaces Warn+). So the cap being hit was silent to the operator by
+// construction. auditkey.TSEResultKey hashes the sale id into one of
+// RingSize buckets instead: total storage from this source is now capped
+// forever, regardless of sale volume, so the failure mode this card exists
+// to fix cannot recur. A genuinely loud, host-level fix for WASM plugins
+// having no way to reach the Problems ring at all is a separate,
+// cross-plugin follow-up (filed as its own card — out of scope here, same
+// shape as this card's own non-goal on raising StorageMaxKeys).
 func recordResult(res tseSignResult) {
-	storagePut("tse_result:"+res.SaleID, mustJSON(res))
+	storagePut(auditkey.TSEResultKey(res.SaleID), mustJSON(res))
 }
 
 // --- DSFinV-K export (fiskaly DSFinV-K API) ---
@@ -651,12 +679,16 @@ func recordResult(res tseSignResult) {
 // ALSO NOT COMPLETE even on the fiskaly side: a real DSFinV-K export
 // requires cash_point_closing records (period aggregates of every signed
 // transaction) to exist before /export is triggered — this skeleton does
-// NOT build those from the tse_result:* records recorded above. Calling
-// exportDSFinVK today would trigger an export against whatever (likely
-// empty) closings already exist in the fiskaly account, not a real export
-// of this till's data. That aggregation step is real, non-trivial work
-// left for whoever takes this further — flagged here and in the README so
-// it isn't discovered late.
+// NOT build those. Calling exportDSFinVK today would trigger an export
+// against whatever (likely empty) closings already exist in the fiskaly
+// account, not a real export of this till's data. That aggregation step
+// is real, non-trivial work left for whoever takes this further —
+// flagged here and in the README so it isn't discovered late. Whoever
+// builds it: source the aggregates from core's own sales data / the
+// fiscal_tse_signatures table (ADR-0044), NOT from tse_result:* plugin
+// storage — since ut-docs#1299 that's a bounded 256-entry sample keyed by
+// a hash of sale id (auditkey.TSEResultKey), not an exhaustive per-sale
+// log, and aggregating from it would silently under-report.
 func exportDSFinVK(fromDate, toDate string) (ok bool, downloadInfo string) {
 	apiKey := strings.TrimSpace(setting("fiskaly_api_key"))
 	apiSecret := strings.TrimSpace(setting("fiskaly_api_secret"))
