@@ -122,11 +122,15 @@ needed, ADR-0002's `tax`/`export` types already exist):
 3. **DSFinV-K export would be incomplete even once wired up.** A real
    DSFinV-K export depends on `cashPointClosing` records — periodic
    aggregates of every signed transaction — existing in the fiskaly account
-   before `/export` is triggered. This plugin does **not** build those from
-   the `tse_result:*` records it saves after each sign attempt. Calling
-   `exportDSFinVK` today triggers an export against whatever (likely empty)
-   closings already exist, not a real export of this till's sales. That
-   aggregation step is real, non-trivial work, left undone here.
+   before `/export` is triggered. This plugin does **not** build those.
+   Calling `exportDSFinVK` today triggers an export against whatever
+   (likely empty) closings already exist, not a real export of this till's
+   sales. That aggregation step is real, non-trivial work, left undone
+   here — whoever builds it should source from core's sales data / the
+   `fiscal_tse_signatures` table (ADR-0044), **not** from `tse_result:*`
+   plugin storage: since ut-docs#1299 that's a bounded 256-entry sample
+   (see Known gap #8), not an exhaustive per-sale log, and aggregating
+   from it would silently under-report.
 
 4. **VAT-rate and payment-type bucketing is best-effort.** `fiscalsign.VATRateBucket`
    maps 19%/7% basis-point rates to fiskaly's `NORMAL`/`REDUCED_1` schema
@@ -169,6 +173,41 @@ needed, ADR-0002's `tax`/`export` types already exist):
    per-sale fallback path now — the day-close grain (v0.5.0) reads the
    archived Z-report's cross-tab, whose banding math already prorates
    discounts, so a discounted sale no longer blocks the preferred export.
+
+8. **`tse_result:*` plugin storage is a bounded 256-key ring, not a
+   per-sale log (ut-docs#1299, fixed).** Before this, `recordResult` keyed
+   by `"tse_result:"+sale_id` directly — one new key per sale, forever,
+   against core's 1024-key-per-plugin `StorageMaxKeys` cap
+   (`internal/data/plugin_repo.go`). A steadily-trading shop exhausted
+   that cap within roughly a thousand sales, and the failure was
+   confirmed silent to the operator: `storagePut`'s only error handling
+   is a `log_write` call, which `internal/plugins/wasm_hostfns.go`'s
+   `hostLogWrite` always routes to `logging.L().Infof` on the host side —
+   never `Warnf`, so it can never reach the operator-visible Problems ring
+   (`internal/logging/logging.go` only surfaces `Warn`+). `recordResult`
+   now keys through `src/auditkey.TSEResultKey`, which hashes the sale id
+   into one of 256 fixed buckets — total storage from this source is
+   capped for the life of the till regardless of sale volume. This is
+   safe because `tse_result:*` has zero readers anywhere in this codebase
+   today (it exists for "a future report/reconciliation surface" that
+   doesn't exist yet) and is **not** the system of record for signing
+   results either way — core independently durably records every outcome
+   via a different mechanism per branch: an approved sale's evidence
+   lands in `fiscal_tse_signatures` (ADR-0044), while a not-signed sale
+   gets a permanent audit-journal marker plus a receipt notice and
+   operator alert (`declareUnsignedFiscalSale`) — either way, independent
+   of anything kept here. (Worth noting: the pre-fix unbounded growth was
+   actually slightly worse than "this plugin's own cap" — `plugin_storage`
+   counts keys per-plugin, so it would eventually have also blocked
+   core's own `fiscal_register:*` writes in the same namespace,
+   ADR-0072.) **Residual, NOT fixed here**: no WASM plugin has
+   any way to reach the operator-visible Problems ring at all — that's a
+   host-function-level gap (`log_write` has no severity parameter, and
+   there is no `report_problem`-shaped host function), affecting every
+   plugin, not just this one. Tracked as a separate follow-up card rather
+   than folded into this one (same reasoning as this card's own non-goal
+   on raising `StorageMaxKeys`: bigger blast radius, needs its own design
+   pass).
 
 ## What's real vs. placeholder
 

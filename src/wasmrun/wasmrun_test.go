@@ -38,10 +38,12 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
+	"fmt"
 	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"testing"
@@ -49,6 +51,8 @@ import (
 	"github.com/tetratelabs/wazero"
 	"github.com/tetratelabs/wazero/api"
 	"github.com/tetratelabs/wazero/imports/wasi_snapshot_preview1"
+
+	"github.com/universaltill/ut-plugin-tax-de/src/auditkey"
 )
 
 // Host ABI (docs repo reference/plugin-host-functions.md, mirrored by every
@@ -639,4 +643,81 @@ func TestTaxRateAsk_DineInAnswersNothing(t *testing.T) {
 	if strings.TrimSpace(out) != "" {
 		t.Fatalf("dine-in produced an answer, want no opinion (empty stdout): %q", out)
 	}
+}
+
+// TestRecordResult_UsesBoundedRingKey is the wasm-level proof for
+// ut-docs#1299: before this card, recordResult (main.go) keyed plugin
+// storage as "tse_result:"+sale_id directly -- one NEW key per distinct
+// sale id, forever. This test drives the REAL compiled plugin.wasm
+// through a handful of distinct sales and asserts every resulting
+// tse_result:* storage key matches the bounded auditkey.TSEResultKey
+// format ("tse_result:NNN", NNN < auditkey.RingSize) and that NONE of
+// them is the literal old-style "tse_result:<sale_id>".
+//
+// If recordResult were reverted to the pre-fix keying, this test fails
+// immediately and unambiguously on the very first sale: the stored key
+// would be the literal "tse_result:<sale_id>" (not <RingSize>-bounded),
+// which the old-style check below catches directly -- this is not a
+// tautology dressed as a test, it genuinely distinguishes the fixed
+// behavior from the broken one it replaced.
+//
+// The exhaustive claim -- that storage from this source can NEVER exceed
+// RingSize keys no matter how many distinct sales a till processes over
+// its lifetime -- is proven separately and far more cheaply by
+// src/auditkey's own TestTSEResultKey_BoundedRegardlessOfVolume (50,000
+// synthetic sale ids, pure Go, no wazero, ~10ms), which exercises the
+// exact same function main.go's recordResult calls. Re-running that
+// scale through a real wazero instantiation per sale here would cost
+// several minutes for no additional assurance -- what THIS test adds
+// that the pure-unit one cannot is proof that the compiled artifact
+// actually wires main.go's recordResult through auditkey.TSEResultKey at
+// all, not just that the function is correct in isolation.
+func TestRecordResult_UsesBoundedRingKey(t *testing.T) {
+	wasm := buildWasm(t)
+	h := configuredHost(scriptedFiskaly(t))
+	keyPattern := regexp.MustCompile(`^tse_result:\d{3}$`)
+
+	saleIDs := []string{"sale-ring-a", "sale-ring-b", "sale-ring-c", "sale-ring-d", "sale-ring-e"}
+	for _, saleID := range saleIDs {
+		event := fmt.Sprintf(`{
+		  "type": "fiscal.sign.ask",
+		  "payload": {
+		    "sale_id": %q,
+		    "currency": "EUR",
+		    "total": 1368,
+		    "payments": [{"method": "card", "amount": 1368}],
+		    "vat_breakdown": [{"rate_bp": 1900, "net": 700, "tax": 133}, {"rate_bp": 700, "net": 500, "tax": 35}]
+		  }
+		}`, saleID)
+		out, hh := run(t, wasm, h, event)
+		if s := statusOf(t, out, hh); s != "approved" {
+			t.Fatalf("sale %s: status = %q, want approved (logs: %v)", saleID, s, hh.logs)
+		}
+
+		// The literal old-style key must never appear -- if it does, this
+		// sale bypassed the ring entirely and recordResult regressed to
+		// the pre-fix per-sale-id keying.
+		if _, ok := h.storage["tse_result:"+saleID]; ok {
+			t.Fatalf("found old-style unbounded key %q in storage -- recordResult is no longer using auditkey.TSEResultKey", "tse_result:"+saleID)
+		}
+
+		wantKey := auditkey.TSEResultKey(saleID)
+		if _, ok := h.storage[wantKey]; !ok {
+			t.Fatalf("sale %s: expected key %q (auditkey.TSEResultKey's own answer for this sale id) not found in storage; keys present: %v", saleID, wantKey, keysOf(h.storage))
+		}
+	}
+
+	for k := range h.storage {
+		if strings.HasPrefix(k, "tse_result:") && !keyPattern.MatchString(k) {
+			t.Errorf("tse_result key %q does not match the bounded-ring format tse_result:NNN", k)
+		}
+	}
+}
+
+func keysOf(m map[string][]byte) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	return out
 }
