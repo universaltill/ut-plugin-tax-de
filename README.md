@@ -83,6 +83,43 @@ needed, ADR-0002's `tax`/`export` types already exist):
   order type is takeaway, or declines (writes nothing) for dine-in or an
   unconfigured tax code — core then falls back to the line's own rate.
 
+## Localization (ut-docs#1883)
+
+The two `export`-type entries' `label` fields are locale keys
+(`tax_de.entry_dsfinvk_export_label`, `tax_de.entry_datev_export_label`),
+not literal English text — per `architecture/plugin-architecture.md` §7's
+convention, resolved by core's `plugins.Manager.syncLocales()` merging this
+plugin's `locales/*.json` into the translator. `locales/en.json` (base) and
+`locales/de.json` (German, the live-pilot market) are shipped; `en.json`'s
+key set is checked against every other locale file by
+`scripts/guard-plugin-i18n.sh` in CI. The `tse-sign-de` (`tax`-type) entry's
+label is left as a plain literal — it isn't rendered anywhere in the till UI
+today (no template calls `T` on a `tax`-type entry's label), so giving it a
+key would be speculative, unverified scope; add one if a real render path
+for it appears.
+
+**Known gaps this does NOT close (see ut-docs#1883's own scoping comment,
+and its independent review, for the full finding):**
+- `ut-plugin-payment-sumup`'s payment-method label ("Card (SumUp)") and
+  every plugin's generic settings-field labels (`fiskaly_api_key`,
+  `sumup_reader_id`, …) render as raw, untranslated text in core today —
+  `web/ui/pages/index.html`'s Pay-tab buttons and
+  `web/ui/pages/plugin_settings.html`'s setting `<label>`s never call `T`
+  on those fields at all, unlike the export-entry picker this card fixed.
+  That's a bigger, cross-cutting core change (payment-method names are
+  copied verbatim into the `payment_methods` table at install/sync time,
+  not resolved at render time), tracked separately rather than attempted
+  here.
+- A **plugin `theme`-type entry's label** (`web/ui/pages/settings.html`'s
+  theme picker, a few hundred lines from the export picker this card
+  fixed) and a **plugin `button`-type entry's label**
+  (`web/ui/partials/plugin_buttons.html`) are the same class of
+  manifest-supplied string as an `export` entry's, and neither goes
+  through `T` either — found in this card's own review, not fixed here
+  since no theme/button plugin in the ecosystem ships a key-shaped label
+  today (nothing to regress), but worth closing in the same pass as the
+  payment-method gap above rather than leaving a third inconsistent spot.
+
 ## Known gaps (read before assuming this "just works")
 
 1. **Cloud-TSE vs. offline-first — the *architectural* half is resolved

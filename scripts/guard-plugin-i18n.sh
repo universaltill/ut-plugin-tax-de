@@ -28,17 +28,40 @@
 #      silently keeps only the last one, so this re-scans the raw text
 #      instead of trusting the parsed object (mirrors guard-i18n.sh check
 #      #9, ut-docs#1872).
+#   5. every manifest.json entries[].label that is KEY-SHAPED (a flat,
+#      lowercase, dot-namespaced token like `tax_de.rate_label` — never a
+#      literal with spaces/punctuation a human would actually read) must
+#      resolve in locales/en.json (ut-docs#1883 review, F1/F2). This is
+#      the one check that runs even with NO locales/ directory at all: a
+#      key-shaped label with nothing backing it is exactly the class of
+#      bug that shipped a real German-pilot regression — ut-plugin-tax-de
+#      0.5.4 changed two entries[].label values to locale keys, but its
+#      OWN scripts/package.sh didn't include locales/ in the release
+#      artifact, so `syncLocales()` found nothing to overlay and the raw
+#      key (e.g. `tax_de.entry_dsfinvk_export_label`) would have rendered
+#      to a merchant instead of "DSFinV-K Export (fiskaly)" — this guard
+#      existed at the time and would NOT have caught it, because it only
+#      checks locale-file-to-locale-file drift, never manifest-to-locale
+#      resolution. This check closes that specific gap; it does not (and
+#      cannot) verify the PACKAGED artifact actually contains locales/ —
+#      that's `scripts/package.sh`'s own job, verify its `entries=(...)`
+#      array separately.
 #
 # Deliberately narrower than guard-i18n.sh's full check list otherwise: a
-# plugin ships a WASM/asset bundle, not a Go html/template app, so as of
-# 2026-09-10 no plugin repo in this org ships a `{{ T "key" }}` template,
-# a Go-side w.Write/RenderError call site, or a ToastMessage field for
-# checks 1/3/6/7 of the core guard to scan — every current UI-facing
-# string ships as a plain literal in manifest.json's own entries[].label
-# instead (a separate, known gap: manifest labels aren't localized at all
-# today, tracked outside this card). If a plugin's own UI surface grows a
-# template/render path later, extend this template rather than assuming
-# key-set parity alone still covers it.
+# plugin ships a WASM/asset bundle, not a Go html/template app, so no
+# plugin repo in this org ships a `{{ T "key" }}` template, a Go-side
+# w.Write/RenderError call site, or a ToastMessage field for checks
+# 1/3/6/7 of the core guard to scan. As of 2026-09-10 (ut-docs#1883), a
+# plugin's `page`-type entries (pre-existing, plugin_page.go) and
+# `export`/`report`-type entries (this card, settings.html) resolve their
+# manifest label through core's `T` via this locales/*.json overlay
+# mechanism; `payment`/`theme`/`button`-type entry labels and every
+# plugin's generic settings-field labels do NOT — those still render
+# whatever literal string the manifest carries, with no translation path
+# at all (a separate, known, cross-cutting core gap, tracked outside this
+# card — see architecture/plugin-architecture.md §7's own note on this).
+# If a plugin's own UI surface grows a template/render path later, extend
+# this template rather than assuming key-set parity alone still covers it.
 #
 # A plugin with no locales/ directory at all passes cleanly — shipping
 # translations is optional (ADR-0010) — so a plugin can wire this guard in
@@ -54,12 +77,66 @@ set -euo pipefail
 ROOT_DIR="${1:-$(pwd)}"
 cd "$ROOT_DIR"
 
+BASE="locales/en.json"
+
+# Check 5 (see header): manifest.json's entries[].label, if key-shaped, must
+# resolve in locales/en.json — runs unconditionally, even with no locales/
+# directory at all, because that absence is exactly the failure this check
+# exists to catch.
+if [ -f manifest.json ]; then
+  python3 - "$BASE" <<'PY'
+import json, re, sys
+
+base_path = sys.argv[1]
+try:
+    manifest = json.load(open("manifest.json", encoding="utf-8"))
+except (OSError, json.JSONDecodeError) as e:
+    print(f"guard-plugin-i18n: manifest.json: cannot read/parse: {e}", file=sys.stderr)
+    sys.exit(1)
+
+# A key looks like `tax_de.rate_label` or `payment_sumup.decline_reason`:
+# flat, lowercase, underscore/digit segments joined by literal dots — never
+# a literal a human wrote (spaces, parens, uppercase, punctuation).
+KEY_RE = re.compile(r'^[a-z][a-z0-9_]*(\.[a-z0-9_]+)+$')
+
+key_labels = []  # (entry key, label)
+for entry in manifest.get("entries", []) or []:
+    label = entry.get("label", "")
+    if isinstance(label, str) and KEY_RE.match(label):
+        key_labels.append((entry.get("key", "?"), label))
+
+if not key_labels:
+    sys.exit(0)  # nothing key-shaped to check; fall through to bash below
+
+import os
+if not os.path.isfile(base_path):
+    print(f"guard-plugin-i18n: manifest.json has {len(key_labels)} key-shaped "
+          f"entries[].label value(s) but {base_path} does not exist:")
+    for entry_key, label in key_labels:
+        print(f"  entries[key={entry_key!r}].label = {label!r}")
+    print("  a key-shaped label with no locales/en.json to resolve it renders "
+          "as this literal key to every merchant, in every locale — either "
+          "add locales/en.json (and confirm scripts/package.sh actually ships "
+          "locales/ in the release artifact), or use a plain human-readable "
+          "literal for this label instead of a key.", file=sys.stderr)
+    sys.exit(1)
+
+base = json.load(open(base_path, encoding="utf-8"))
+missing = [(k, lbl) for k, lbl in key_labels if lbl not in base]
+if missing:
+    print(f"guard-plugin-i18n: manifest.json entries[].label key(s) not found in {base_path}:")
+    for entry_key, label in missing:
+        print(f"  entries[key={entry_key!r}].label = {label!r} — no such key in {base_path}")
+    sys.exit(1)
+print(f"guard-plugin-i18n: {len(key_labels)} manifest entries[].label key(s) resolve in {base_path}")
+PY
+fi
+
 if [ ! -d locales ]; then
-  echo "guard-plugin-i18n: no locales/ directory — nothing to check"
+  echo "guard-plugin-i18n: no locales/ directory — nothing further to check"
   exit 0
 fi
 
-BASE="locales/en.json"
 if [ ! -f "$BASE" ]; then
   echo "guard-plugin-i18n: locales/ exists but $BASE is missing — every plugin locale overlay needs an en.json base" >&2
   exit 1
