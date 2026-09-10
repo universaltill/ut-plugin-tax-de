@@ -22,6 +22,10 @@ cd "$(dirname "$0")/.."
 REAL_SCRIPT="$(pwd)/scripts/check-version-bump.sh"
 PACKAGE_SH="$(pwd)/scripts/package.sh"
 BUILD_SH="$(pwd)/scripts/build.sh"
+# Repo-relative form of BUILD_SH -- the build recipe is itself an input to
+# the compiled artifact, so SHIPPED_PATTERNS has to cover this exact path
+# (see the gitignored-entry branch of the "entries mirror" case below).
+BUILD_SH_REL="scripts/build.sh"
 FAILS=0
 
 work_dir=""
@@ -232,9 +236,10 @@ assert_fail_containing "manifest changed without version bump" "manifest.json" "
 # OUTPUT, not a tracked file, and can never appear in `git diff --name-only`
 # -- so for a gitignored entry this instead requires that build.sh's own
 # `go build ... <SOURCE_DIR>` argument (with a leading "./" stripped) has a
-# matching "<source_dir>/*" pattern in SHIPPED_PATTERNS, AND that go.mod +
-# go.sum are both covered too (a dependency bump changes the compiled
-# binary without touching anything under src/ at all). This is what a real
+# matching "<source_dir>/*" pattern in SHIPPED_PATTERNS, AND that go.mod,
+# go.sum and the build script itself are all covered too (a dependency bump
+# or a build-flag change alters the compiled binary without touching
+# anything under src/ at all). This is what a real
 # change to package.sh's bundle, build.sh's source directory, or
 # check-version-bump.sh's SHIPPED_PATTERNS would be caught by drifting from
 # each other.
@@ -246,7 +251,21 @@ else
     array_body="${entries_line#entries=(}"
     array_body="${array_body%)}"
     read -r -a bundle_entries <<<"$array_body"
-    patterns=$(grep -oE "'[^']*'" "$REAL_SCRIPT" | tr -d "'")
+    # Scoped to the SHIPPED_PATTERNS=(...) array body ONLY, with comments
+    # stripped. Scanning the whole script for any single-quoted token (this
+    # check's original form) let a quoted mention in a COMMENT stand in for a
+    # real array entry -- and check-version-bump.sh is a deliberately
+    # comment-heavy script. Proved by mutation in this guard's 2026-09-10
+    # review: replacing the `'go.sum'` array line with a comment containing
+    # `'go.sum'` left this case green, and since LICENSE and go.sum had no
+    # behavioural case of their own at the time, the ENTIRE suite stayed green
+    # while the guard silently stopped covering them. `# ...` is stripped
+    # before the quoted tokens are read (no SHIPPED_PATTERNS entry contains a
+    # '#'), so neither a comment outside the array nor one inside it can
+    # masquerade as an entry.
+    patterns=$(awk '/^SHIPPED_PATTERNS=\(/ {inside = 1; next}
+                    inside && /^\)/ {inside = 0}
+                    inside' "$REAL_SCRIPT" | sed 's/#.*//' | grep -oE "'[^']*'" | tr -d "'")
 
     build_line=$(grep -m1 'go build ' "$BUILD_SH") || build_line=""
     if [ -z "$build_line" ]; then
@@ -293,6 +312,14 @@ else
                 echo "FAIL [entries mirror]: '$entry' is a compiled artifact but SHIPPED_PATTERNS has no 'go.sum' entry (a dependency bump changes the binary without touching $source_dir)"
                 mismatch=1
             fi
+            # The build RECIPE is an input to the artifact too: a new
+            # -ldflags/-trimpath/-tags, a different GOOS/GOARCH or -o path
+            # changes the shipped binary with every file under $source_dir
+            # byte-identical.
+            if ! grep -qxF "$BUILD_SH_REL" <<<"$patterns"; then
+                echo "FAIL [entries mirror]: '$entry' is a compiled artifact but SHIPPED_PATTERNS has no '${BUILD_SH_REL}' entry (a build-flag change rebuilds the binary without touching $source_dir)"
+                mismatch=1
+            fi
         else
             # Tracked entry: same check as the asset-only plugins' guard.
             if ! grep -qxF "$entry" <<<"$patterns" && ! grep -qxF "${entry}/*" <<<"$patterns"; then
@@ -314,7 +341,7 @@ else
         mismatch=1
     fi
     if [ "$mismatch" -eq 0 ]; then
-        echo "ok   [entries mirror] (package.sh: ${bundle_entries[*]} + conditional LICENSE/locales; compiled from: ${source_dir})"
+        echo "ok   [entries mirror] (package.sh: ${bundle_entries[*]} + conditional LICENSE/locales; compiled from: ${source_dir} via ${BUILD_SH_REL})"
     else
         FAILS=$((FAILS + 1))
     fi
@@ -435,6 +462,53 @@ mkdir -p "${case_dir}/src/fiscalsign"
 echo 'package fiscalsign' >"${case_dir}/src/fiscalsign/fiscalsign.go"
 commit_change
 assert_fail_containing "nested src/ file added, no bump" "src/fiscalsign/fiscalsign.go" "FAIL"
+
+# --- case 16: LICENSE changed, version NOT bumped -> FAIL -----------------
+# LICENSE ships conditionally, so it never appears on package.sh's own
+# entries=(...) line and the "entries mirror" case was its ONLY coverage.
+# Added in this guard's 2026-09-10 review after a mutation showed a mirror-
+# test false pass on LICENSE left the whole suite green.
+fresh_repo
+echo "MIT (2026)" >"${case_dir}/LICENSE"
+commit_change
+assert_fail_containing "LICENSE changed, no bump" "LICENSE" "FAIL"
+
+# --- case 17: go.sum changed, version NOT bumped -> FAIL ------------------
+# Same reason as case 16: go.sum had only "entries mirror" coverage. A
+# `go mod tidy` that rewrites go.sum alone still relinks the binary.
+fresh_repo
+echo "example.com/newdep v1.0.0 h1:abc=" >"${case_dir}/go.sum"
+commit_change
+assert_fail_containing "go.sum changed, no bump" "go.sum" "FAIL"
+
+# --- case 18: scripts/build.sh changed (build recipe), no bump -> FAIL ----
+# The build RECIPE is an input to bin/plugin.wasm just as much as src/ is:
+# adding -trimpath/-ldflags/-tags, or changing GOOS/GOARCH, produces a
+# different shipped binary with src/ byte-identical. Found as a real false
+# negative in this guard's 2026-09-10 review.
+fresh_repo
+cat >>"${case_dir}/scripts/build.sh" <<'BUILD'
+# rebuilt with -trimpath from here on
+BUILD
+commit_change
+assert_fail_containing "build.sh recipe changed, no bump" "scripts/build.sh" "FAIL"
+
+# --- case 19: a shipped file RENAMED OUT of a shipped location -> FAIL ----
+# `git diff --name-only` with rename detection (git's default) prints only
+# the DESTINATION, so `git mv src/x.go docs/x.go` -- which really does remove
+# a file from the compiled package -- reported as a lone `docs/x.go` and the
+# guard answered "no shipped file changed". Found as a real false negative in
+# this guard's 2026-09-10 review; check-version-bump.sh now passes
+# --no-renames so the src/ side shows up as a delete.
+fresh_repo
+mkdir -p "${case_dir}/src/fiscalsign"
+echo 'package fiscalsign' >"${case_dir}/src/fiscalsign/fiscalsign.go"
+(cd "$case_dir" && git add -A && git commit -q -m "add a nested source file")
+base_sha=$(cd "$case_dir" && git rev-parse HEAD)
+(cd "$case_dir" && git mv src/fiscalsign/fiscalsign.go docs/fiscalsign.go)
+commit_change
+assert_fail_containing "source file renamed out of src/, no bump" \
+    "src/fiscalsign/fiscalsign.go" "FAIL"
 
 if [ "$FAILS" -ne 0 ]; then
     echo ""

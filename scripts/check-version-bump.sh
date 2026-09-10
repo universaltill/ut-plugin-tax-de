@@ -24,7 +24,11 @@
 # therefore unsafe here -- it would silently never fire. Instead this keys
 # off the SOURCE that PRODUCES bin/plugin.wasm: every file under src/ (the
 # `go build ... ./src` argument), plus go.mod/go.sum (a dependency bump
-# changes the compiled binary without touching anything under src/ at all).
+# changes the compiled binary without touching anything under src/ at all),
+# plus scripts/build.sh itself -- it is the BUILD RECIPE, so an edit to it
+# (a new -ldflags/-trimpath/-tags, a different GOOS/GOARCH or -o path)
+# changes the shipped binary while every file under src/ stays byte-identical
+# (verified as a real false negative in this guard's 2026-09-10 review).
 # See check-version-bump.test.sh's "entries mirror" case for how this is
 # verified against package.sh's and build.sh's own source, and
 # docs/code-reviews/ for the rollout card (ut-docs#1948) tracking which
@@ -55,6 +59,7 @@ SHIPPED_PATTERNS=(
     'src/*'
     'go.mod'
     'go.sum'
+    'scripts/build.sh'
 )
 
 # BASE_SHA/HEAD_SHA follow the same convention as
@@ -93,7 +98,17 @@ MERGE_BASE=$(git merge-base "$BASE_SHA" "$HEAD_SHA") || {
 # core.quotePath=false so a shipped path with non-ASCII characters is
 # printed as a real UTF-8 path, not C-style-quoted octal escapes that would
 # never match SHIPPED_PATTERNS.
-changed_files=$(git -c core.quotePath=false diff --name-only "$MERGE_BASE" "$HEAD_SHA" -- .)
+#
+# --no-renames because rename detection (on by default since git 2.9) prints
+# only the DESTINATION path for a renamed file, which hides every rename OUT
+# of a shipped location: `git mv src/fiscalsign/f.go docs/f.go` deletes a
+# file from the compiled package but reports as a lone `docs/f.go`, and the
+# guard would answer "no shipped file changed" (verified as a real false
+# negative in this guard's 2026-09-10 review). With --no-renames the same
+# change reports as a delete + an add, so the src/ side is seen. Renames INTO
+# or WITHIN a shipped location were already caught either way (the
+# destination is the shipped path), so this only ever adds coverage.
+changed_files=$(git -c core.quotePath=false diff --no-renames --name-only "$MERGE_BASE" "$HEAD_SHA" -- .)
 
 shipped_changed=()
 while IFS= read -r f; do
