@@ -323,6 +323,19 @@ Known gaps #5/#6/#7.
 
 ## Before committing
 
+- **Any PR that touches a shipped file — `manifest.json`, `README.md`,
+  `LICENSE`, `locales/*`, or the WASI module's source (`src/*`, `go.mod`,
+  `go.sum`) — must bump `manifest.json`'s `version` in the same PR.**
+  `scripts/package.sh` bundles `manifest.json`/`README.md`/`LICENSE`/
+  `locales/` plus the *compiled* `bin/plugin.wasm` into the release
+  artifact; `bin/` is gitignored and can never appear in a diff, so the
+  guard keys off the source that produces it (`src/*`, `go.mod`, `go.sum`)
+  instead. `auto-tag-release.yml` only cuts a release when the version
+  differs from the last tag; without a bump the change lands on `main` and
+  then silently never ships (ut-docs#1940, rolled out to this repo in
+  ut-docs#1948). Enforced by `scripts/check-version-bump.sh` (CI job
+  `version-bump`, PRs only). A PR touching only `docs/`/`.github/` is
+  exempt. Never publish by hand — tag `v<version>`.
 - `go test ./...` — now covers `src/datev`, `src/fiskalyparse`,
   `src/fiscalsign`, `src/taxrate` and `src/wasmrun` (the last actually
   compiles and runs the plugin as wasm, so it is slower than the rest;
