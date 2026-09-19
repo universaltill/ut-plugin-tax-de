@@ -208,13 +208,15 @@ transaction first, which this plugin does not build (see README "Known
 gaps"). Don't remove the doc comments explaining this — they're load-bearing
 context for whoever wires the dispatcher up.
 
-## `export` canonical type now has TWO entries (ut-docs#41)
+## `export` canonical type now has THREE entries (ut-docs#41, #937)
 
 `manifest.json`'s `entries[]` has a second `type: export` item,
-`datev-buchungsstapel-export-de`, alongside `dsfinvk-export-de`. Both answer
-`export.requested.ask`, dispatched in `src/main.go` by `payload.EntryKey` —
-if you add a third export entry, extend that switch, don't just check
-against one constant again. Unlike DSFinV-K, the DATEV path needs no
+`datev-buchungsstapel-export-de`, alongside `dsfinvk-export-de` — and, since
+v0.6.0, a third, `paragraph146a-de` (the §146a Abs. 4 AO notification
+summary, `src/paragraph146a`). All three answer `export.requested.ask`,
+dispatched in `src/main.go` by `payload.EntryKey` — if you add a fourth
+export entry, extend that switch, don't just check against one constant
+again. Unlike DSFinV-K, the DATEV and paragraph146a paths need no
 fiskaly account: it's pure local data transformation (`src/datev`),
 returned inline via `content_b64`. Since v0.5.0 (ut-docs#1005) the entry
 declares the `eod_closes` entity and the PREFERRED grain is
@@ -289,6 +291,14 @@ Known gaps #5/#6/#7.
   go command's result cache does not treat `main.go` as an input, and the
   suite will happily cache a PASS across a change that deletes the hook
   (observed for real, 2026-08-19). Don't remove those reads.
+- `src/paragraph146a/` — §146a Abs. 4 AO human-readable notification summary
+  (ut-docs#937), deliberately its OWN package with no `//go:build wasip1`
+  tag (same reason as `src/datev/`), so `go test ./src/paragraph146a/...`
+  runs on the host. `Build` groups the host-supplied register rows by
+  business location (gross method), refuses on an empty register, and
+  never emits a TSE-PIN/PUK field (there is no such field on `Row` at
+  all — the incumbent vendor's own output was found to leak both, see
+  README's status table).
 - `src/datev/` — DATEV EXTF Buchungsstapel file-building logic, deliberately
   its OWN package with no `//go:build wasip1` tag (unlike `src/main.go`) so
   `go test ./src/datev/...` runs on the host with no wasm build — the only

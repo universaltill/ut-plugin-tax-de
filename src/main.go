@@ -100,6 +100,7 @@ import (
 	"github.com/universaltill/ut-plugin-tax-de/src/datev"
 	"github.com/universaltill/ut-plugin-tax-de/src/fiscalsign"
 	"github.com/universaltill/ut-plugin-tax-de/src/fiskalyparse"
+	"github.com/universaltill/ut-plugin-tax-de/src/paragraph146a"
 	"github.com/universaltill/ut-plugin-tax-de/src/taxrate"
 )
 
@@ -143,6 +144,11 @@ const dsfinvkExportEntryKey = "dsfinvk-export-de"
 // datevExportEntryKey must match manifest.json's second "export" entries[]
 // item — see dsfinvkExportEntryKey's doc comment for why this check exists.
 const datevExportEntryKey = "datev-buchungsstapel-export-de"
+
+// paragraph146aExportEntryKey must match manifest.json's third "export"
+// entries[] item — see dsfinvkExportEntryKey's doc comment for why this
+// check exists.
+const paragraph146aExportEntryKey = "paragraph146a-de"
 
 const (
 	tokenStorageKey = "fiskaly_token" // cached {access_token, obtained_at}
@@ -818,6 +824,46 @@ func handleDATEVClosesExport(closes []datev.EODCloseExport) {
 	os.Exit(0)
 }
 
+// handleParagraph146aExport answers export.requested.ask for the
+// paragraph146a-de entry (ut-docs#937): pure local transformation of the
+// host-supplied §146a Abs. 4 AO register into a human-readable notification
+// summary, returned inline via content_b64 — same cycle as
+// handleDATEVExport. No settings to read (unlike DATEV, nothing here is
+// merchant/accountant-configured — every field comes straight from the
+// register) and no network call (unlike DSFinV-K).
+func handleParagraph146aExport(rows []paragraph146a.Row) {
+	// rows == nil (JSON null) and a non-nil, zero-length rows (JSON "[]")
+	// are two different host answers (ut-docs#937's own contract, mirroring
+	// eod_closes) -- null means the host never declared/granted this
+	// plugin's read of the register at all (a config gap, fixable in
+	// Settings, not by adding tills), while "[]" means the register is
+	// genuinely empty (fixable by adding tills under Fiscal Register).
+	// Collapsing the two (independent-review finding S2) sent an operator
+	// with a working, correctly-configured install to a page that already
+	// lists all their tills.
+	if rows == nil {
+		logf("tax-de: paragraph146a export: host sent fiscal_register_de=null")
+		fmt.Print(string(mustJSON(map[string]any{
+			"ok":    false,
+			"error": "this plugin is not granted fiscal_register_de:read (or the export entry doesn't declare it) — check the plugin's permissions in Settings",
+		})))
+		os.Exit(0)
+	}
+	result, err := paragraph146a.Build(rows, time.Now())
+	if err != nil {
+		logf("tax-de: paragraph146a export failed: %v", err)
+		fmt.Print(string(mustJSON(map[string]any{"ok": false, "error": err.Error()})))
+		os.Exit(0)
+	}
+	logf("tax-de: paragraph146a export built entries=%d bytes=%d", len(rows), len(result.Content))
+	fmt.Print(string(mustJSON(map[string]any{
+		"ok":          true,
+		"filename":    result.Filename,
+		"content_b64": base64.StdEncoding.EncodeToString(result.Content),
+	})))
+	os.Exit(0)
+}
+
 // datevSettings reads and parses the datev_* plugin settings. Erloeskonten/
 // BuSchluessel/KonteByMethod are merchant/accountant-configured JSON maps
 // (tax_rate_bp or payment-method id -> account number) — see the datev
@@ -891,11 +937,12 @@ func main() {
 	// against a future second export entry in this same plugin.
 	case ev.Type == "export.requested.ask":
 		var payload struct {
-			From      string                 `json:"from"`
-			To        string                 `json:"to"`
-			EntryKey  string                 `json:"entry_key"`
-			Sales     []datev.SaleRow        `json:"sales"`      // ut-docs#221 — only the DATEV path below consumes this; DSFinV-K stays fiskaly-triggered, no local data needed
-			EODCloses []datev.EODCloseExport `json:"eod_closes"` // ut-docs#1005 — archived day-closes (Z-reports); a supporting host always sends the field ("[]" when the range has no archived close), so nil here means a pre-#1005 host — see the routing comment below
+			From             string                 `json:"from"`
+			To               string                 `json:"to"`
+			EntryKey         string                 `json:"entry_key"`
+			Sales            []datev.SaleRow        `json:"sales"`              // ut-docs#221 — only the DATEV path below consumes this; DSFinV-K stays fiskaly-triggered, no local data needed
+			EODCloses        []datev.EODCloseExport `json:"eod_closes"`         // ut-docs#1005 — archived day-closes (Z-reports); a supporting host always sends the field ("[]" when the range has no archived close), so nil here means a pre-#1005 host — see the routing comment below
+			FiscalRegisterDE []paragraph146a.Row    `json:"fiscal_register_de"` // ut-docs#937 — only the paragraph146a-de path below consumes this
 		}
 		var wrapper struct {
 			Payload json.RawMessage `json:"payload"`
@@ -944,6 +991,8 @@ func main() {
 			} else {
 				handleDATEVExport(payload.From, payload.To, payload.Sales)
 			}
+		case paragraph146aExportEntryKey:
+			handleParagraph146aExport(payload.FiscalRegisterDE)
 		case dsfinvkExportEntryKey, "":
 			// "" (no entry_key) preserves this plugin's pre-ut-docs#41
 			// behavior, from when dsfinvk-export-de was its only export
@@ -952,7 +1001,7 @@ func main() {
 			// is defensive only.
 			handleDSFinVKExport(payload.From, payload.To)
 		default:
-			logf("tax-de: export.requested.ask for entry_key=%q, not ours (%q or %q) — declining", payload.EntryKey, dsfinvkExportEntryKey, datevExportEntryKey)
+			logf("tax-de: export.requested.ask for entry_key=%q, not ours (%q, %q or %q) — declining", payload.EntryKey, dsfinvkExportEntryKey, datevExportEntryKey, paragraph146aExportEntryKey)
 			os.Exit(0)
 		}
 

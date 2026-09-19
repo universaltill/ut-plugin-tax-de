@@ -32,6 +32,7 @@ vs. "researched, not tested":
 | DATEV EXTF file structure (31-field header row 1, 125-column header row 2, semicolon-delimited, Windows-1252, CRLF) | **Confirmed against a real reference file** (github.com/ledermann/datev's `EXTF_Buchungsstapel.csv`, byte-verified 2026-08-01), not reconstructed from memory — see `src/datev/datev.go`'s package doc comment. An independent review caught an early draft undercounting header row 1's trailing fields (27 vs. the real 31); fixed and pinned by `TestHeader1_FieldCount`. Unit-tested (`go test ./src/datev/...`), including a Windows-1252 round-trip check on the umlaut/en-dash header text. |
 | DATEV format-version numbers (`700`/`21`/`13`) and Soll/Haben booking convention (Kasse debited, Erlöskonto credited via an Automatikkonto, no BU-Schlüssel by default) | **Researched, not confirmed against DATEV's current published spec** (developer.datev.de 403'd when fetched) or a real accountant/DATEV import. Matches the reference file and common SKR03/04 practice, but NEEDS ACCOUNTANT VERIFICATION before a real filing. |
 | DATEV chart-of-accounts mapping (which Konto/Gegenkonto number per tax rate) | **Never guessed.** No default real account numbers anywhere in this plugin — `datev_konten_by_method`/`datev_erloeskonten`/`datev_konto_gutschein`/`datev_konto_gutschein_zahlung`/`datev_konto_geldtransit`/`datev_konto_trinkgeld` (and the legacy `datev_konto_kasse`) are merchant/accountant-configured settings; the export refuses (with a clear error) rather than emit an unconfigured, ambiguous or invented account number. |
+| §146a Abs. 4 AO notification summary (`paragraph146a-de`, ut-docs#937) | **Local data transformation, no external API — the whole plugin-side field list/order/labels mirror the pilot's incumbent (certified) vendor's own output**, captured in ut-docs#665's 2026-08-14 research comment. `go test ./src/paragraph146a/...`. **Does NOT include ELSTER XML** (the real schema is unverified against BMF/ELSTER docs — deliberately deferred, not guessed, see ut-docs#937's "Explicitly NOT in this card") and **does NOT file anything** — the shop still submits via Mein ELSTER themselves. **Excludes TSE-PIN/TSE-PUK by construction** — the till never stores either (the incumbent's own output was found to leak both in plain text); this is a satisfied non-goal, not a redaction. `Ablaufdatum der TSE` (TSE expiry) is a known gap — the core register doesn't track it yet, see "Known gaps" below. |
 
 ## What this plugin does
 
@@ -72,6 +73,16 @@ needed, ADR-0002's `tax`/`export` types already exist):
   the concept) does the pre-v0.5.0 per-sale grain (`datev.Build`, one row
   per sale × tax line against `datev_konto_kasse`, ut-docs#221) still
   answer — see `src/main.go`'s routing comment.
+- **`export` — §146a Abs. 4 AO notification summary (ut-docs#937, v0.6.0).**
+  A third `export`-type entry (`paragraph146a-de`), declaring the
+  `fiscal_register_de` entity. Like DATEV, needs no fiskaly account: pure
+  local transformation of the host-supplied till/TSE register
+  (`internal/data.FiscalRegisterDEStore`, core, #665) into a plain-text
+  human-readable summary, grouped by business location (gross method — one
+  block per location covering every till/TSE recorded there, never one per
+  till), returned inline (`content_b64`) — see `src/paragraph146a/`. Data
+  capture only, same as #665: this does not file the notification, the shop
+  still submits it via Mein ELSTER themselves.
 - **Dine-in/takeaway VAT rate switching (§12 UStG).** Subscribes to
   `tax.rate.ask` — a generic, blocking, value-returning hook
   (`EventBus.Ask`) universal-till's core added specifically so this rule
@@ -85,9 +96,9 @@ needed, ADR-0002's `tax`/`export` types already exist):
 
 ## Localization (ut-docs#1883)
 
-The two `export`-type entries' `label` fields are locale keys
-(`tax_de.entry_dsfinvk_export_label`, `tax_de.entry_datev_export_label`),
-not literal English text — per `architecture/plugin-architecture.md` §7's
+The three `export`-type entries' `label` fields are locale keys
+(`tax_de.entry_dsfinvk_export_label`, `tax_de.entry_datev_export_label`,
+`tax_de.entry_paragraph146a_export_label`), not literal English text — per `architecture/plugin-architecture.md` §7's
 convention, resolved by core's `plugins.Manager.syncLocales()` merging this
 plugin's `locales/*.json` into the translator. `locales/en.json` (base) and
 `locales/de.json` (German, the live-pilot market) are shipped; `en.json`'s
@@ -523,6 +534,16 @@ with any chart once every method/rate that appears is covered.
 12. **Push sale-level discounts down into `sale_lines`** (Known gap #7) so a
     discounted sale's tax-line sum reconciles with its total — until then,
     any period containing a discounted sale can't be DATEV-exported at all.
+13. **The §146a export has no ELSTER XML, and no TSE expiry field.**
+    ut-docs#937's own scope deliberately defers the real
+    `Mitteilungsverfahren nach § 146a Abs. 4 AO` XML upload schema until it's
+    confirmed against BMF/ELSTER documentation (or fiskaly's SUBMIT DE
+    product turns out to cover this and make hand-built XML moot — see
+    ut-docs#665's 2026-08-19 research comment). Separately, the incumbent
+    vendor's own output includes `Ablaufdatum der TSE` (a hardware TSE's
+    real 3–5 year expiry; a cloud TSE reports a `01.01.9999` no-expiry
+    sentinel) — core's register (#665) does not capture this field at all
+    yet, so this plugin's summary omits it rather than guess a value.
 
 ## Build
 
