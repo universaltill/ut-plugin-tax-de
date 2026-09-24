@@ -25,8 +25,8 @@
 //     amounts_per_vat_rate/amounts_per_payment_type as the SAME positive
 //     magnitudes a sale would carry (distinguished purely by
 //     receipt_type=RECEIPT_0104) or as NEGATIVE amounts — this plugin sends
-//     positive magnitudes unconditionally either way (fiscalsign.VATAmounts/
-//     PaymentAmounts do not read sale_type at all), which is what core's own
+//     positive magnitudes unconditionally either way (fiscalsign.BuildReceipt
+//     does not read sale_type at all), which is what core's own
 //     contract already sends (fiscal-sign-ask.md: "every amount in a return
 //     is the absolute value being handed back") — if fiskaly's schema
 //     actually wants a signed sign per receipt_type, this still records the
@@ -47,14 +47,16 @@
 //     whole failure surface (journal marker, receipt notice, operator
 //     alert, background re-ask), so this plugin's own private retry queue
 //     was both redundant and actively corrupting its audit records.
-//   - REFUSES to sign an unbalanced receipt. fiskaly renders standard_v1
-//     into DSFinV-K's Beleg^<per VAT rate>^<per payment type>, whose halves
-//     must be equal. A tip rides the payment side with no VAT bucket, and a
-//     sale-level discount/service charge moves the total without moving the
-//     per-line vat_breakdown — so those sales currently do NOT sign, by
-//     design, and take core's declared-and-retried path instead. The
-//     correct German tax representation is an open accountant question,
-//     ut-docs#833. Do not "fix" this by picking a bucket and signing.
+//   - Builds a BALANCED receipt or refuses to sign (ut-docs#833).
+//     fiskaly renders standard_v1 into DSFinV-K's Beleg^<per VAT
+//     rate>^<per payment type>, whose halves must be equal.
+//     fiscalsign.BuildReceipt splits a whole-bill discount across the
+//     rates by gross (Rabatt), puts an employee's tip in the 0%/NULL bucket
+//     (TrinkgeldAN), places a tip the business keeps per the merchant's
+//     tip_business_vat_treatment setting (TrinkgeldAG), and answers
+//     cannot-sign for anything that still does not reconcile. The research
+//     and sources are on ut-docs#833; the merchant's Steuerberater confirms
+//     the setting, not this code.
 //   - DSFinV-K export format/content compliance has NOT been legally
 //     verified against KassenSichV. Cash-point-closing generation (the
 //     aggregation step DSFinV-K exports actually depend on) is NOT
@@ -83,7 +85,7 @@
 // legal/TSE-vendor question, not something this code decides.
 //
 // Two hard rules survive: never fabricate a signature, and never sign a
-// receipt already known to misstate the sale (see fiscalsign.BalanceDelta).
+// receipt already known to misstate the sale (see fiscalsign.BuildReceipt).
 package main
 
 import (
@@ -531,24 +533,27 @@ func handleFiscalSignAsk(raw []byte) {
 		os.Exit(0)
 	}
 
-	// Refuse to sign a receipt whose own two halves disagree.
+	// Build the receipt so its two halves agree, or refuse to sign it.
 	//
 	// fiskaly renders standard_v1 into DSFinV-K's `Beleg^<per VAT
-	// rate>^<per payment type>`, and those halves must be equal. Core can
-	// legitimately hand us an unbalanced request — a tip rides the payment
-	// side with no VAT bucket, and a sale-level discount/service charge
-	// moves `total` without moving the per-line `vat_breakdown`. How those
-	// SHOULD be represented is a German tax question, asked of a real
-	// accountant in ut-docs#833, not something to guess here.
+	// rate>^<per payment type>`, and those halves must be equal.
+	// fiscalsign.BuildReceipt applies the treatments researched in
+	// ut-docs#833 — whole-bill discount split across rates by gross
+	// (Rabatt), employee tip in the 0%/NULL bucket (TrinkgeldAN), business
+	// tip per the merchant's tip_business_vat_treatment setting
+	// (TrinkgeldAG) — and refuses anything that still does not reconcile.
 	//
-	// A TSE signature cannot be corrected afterwards, so signing a receipt
-	// we already know misstates the sale is worse than declaring a gap:
-	// core's proceed-and-declare path completes the sale, marks it
-	// unsigned, prints the outage notice, alerts the operator and retries.
-	// Same principle as never fabricating a signature.
-	if delta := fiscalsign.BalanceDelta(req); delta != 0 {
-		logf("tax-de: fiscal.sign.ask: REFUSING to sign sale %s — VAT side and payment side differ by %d minor units (tip / sale-level discount / service charge; see ut-docs#833). Answering unreachable.", req.SaleID, delta)
-		fmt.Print(string(fiscalsign.Unreachable().JSON()))
+	// A TSE signature cannot be corrected afterwards, so a receipt known
+	// to misstate the sale is never signed: answer cannot-sign (contract
+	// 1.3.0), and core completes the sale unsigned, journals it, prints
+	// the notice and alerts the operator. Same principle as never
+	// fabricating a signature.
+	receipt, err := fiscalsign.BuildReceipt(req, fiscalsign.Options{
+		BusinessTip: fiscalsign.ParseBusinessTipTreatment(setting("tip_business_vat_treatment")),
+	})
+	if err != nil {
+		logf("tax-de: fiscal.sign.ask: REFUSING to sign sale %s — %v (ut-docs#833). Answering cannot-sign.", req.SaleID, err)
+		fmt.Print(string(fiscalsign.CannotSign().JSON()))
 		os.Exit(0)
 	}
 
@@ -566,8 +571,8 @@ func handleFiscalSignAsk(raw []byte) {
 	in := signInput{
 		SaleID:   req.SaleID,
 		SaleType: saleType,
-		VAT:      fiscalsign.VATAmounts(req),
-		Payments: fiscalsign.PaymentAmounts(req),
+		VAT:      receipt.VAT,
+		Payments: receipt.Payments,
 	}
 	res := signTransaction(in, apiKey, apiSecret, tssID, clientID)
 	recordResult(res)

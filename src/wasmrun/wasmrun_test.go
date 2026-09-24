@@ -485,29 +485,120 @@ func statusOf(t *testing.T, out string, h *stubHost) string {
 	return got.Status
 }
 
-// A tipped sale is exactly the case the independent review caught: the tip
-// rides the payment side and lands in no VAT bucket, so the DSFinV-K
-// Beleg's two halves disagree. Until an accountant rules on the correct
-// representation (ut-docs#833) the plugin must refuse to sign rather than
-// write an irreversible TSE record that misstates the sale.
+// A receipt that cannot be made to balance (here the payments cover the
+// total neither with nor without the tip) must never reach fiskaly: the
+// plugin answers cannot-sign (contract 1.3.0), not unreachable — it is not
+// an outage, and core words the two differently (ut-docs#833).
 func TestFiscalSignAsk_RefusesToSignAnUnbalancedReceipt(t *testing.T) {
+	wasm := buildWasm(t)
+	const unbalanced = `{
+	  "type": "fiscal.sign.ask",
+	  "payload": {
+	    "sale_id": "sale-bad",
+	    "currency": "EUR",
+	    "total": 1190,
+	    "tax_inclusive": true,
+	    "payments": [{"method": "card", "amount": 1000, "tip_amount": 100}],
+	    "vat_breakdown": [{"rate_bp": 1900, "net": 1190, "tax": 190}]
+	  }
+	}`
+	out, h := run(t, wasm, configuredHost(scriptedFiskaly(t)), unbalanced)
+	if s := statusOf(t, out, h); s != "cannot-sign" {
+		t.Errorf("status = %q, want cannot-sign for an unbalanced receipt", s)
+	}
+	if len(h.calls) != 0 {
+		t.Errorf("contacted fiskaly %d times for a receipt it should have refused outright", len(h.calls))
+	}
+}
+
+// ut-docs#833, the card's own example: a €12.90 bill paid €14.00 on the
+// card, €1.10 tip to the employee. It now SIGNS: the tip is TrinkgeldAN —
+// not the business's turnover — so it sits in the 0%/NULL bucket and the
+// Beleg's halves agree (12.90 + 1.10 = 14.00).
+func TestFiscalSignAsk_EmployeeTipSignsInNullBucket(t *testing.T) {
 	wasm := buildWasm(t)
 	const tipped = `{
 	  "type": "fiscal.sign.ask",
 	  "payload": {
 	    "sale_id": "sale-tip",
 	    "currency": "EUR",
-	    "total": 1190,
-	    "payments": [{"method": "card", "amount": 1190, "tip_amount": 100}],
-	    "vat_breakdown": [{"rate_bp": 1900, "net": 1000, "tax": 190}]
+	    "total": 1290,
+	    "tax_inclusive": true,
+	    "payments": [{"method": "card", "amount": 1400, "tip_amount": 110, "tip_recipient": "employee"}],
+	    "vat_breakdown": [{"rate_bp": 1900, "net": 1290, "tax": 206}]
 	  }
 	}`
 	out, h := run(t, wasm, configuredHost(scriptedFiskaly(t)), tipped)
-	if s := statusOf(t, out, h); s != "unreachable" {
-		t.Errorf("status = %q, want unreachable for an unbalanced receipt", s)
+	if s := statusOf(t, out, h); s != "approved" {
+		t.Fatalf("status = %q, want approved (logs: %v)", s, h.logs)
+	}
+	body := strings.ReplaceAll(h.calls[2].Body(), " ", "")
+	for _, want := range []string{
+		`{"vat_rate":"NORMAL","amount":"12.90"}`,
+		`{"vat_rate":"NULL","amount":"1.10"}`,
+		`{"payment_type":"NON_CASH","amount":"14.00"}`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("finish body missing %s\nbody: %s", want, body)
+		}
+	}
+}
+
+// A tip the business keeps, with the merchant's setting at refuse: the
+// plugin must not sign, and must not contact fiskaly.
+func TestFiscalSignAsk_BusinessTipRefuseSettingIsHonoured(t *testing.T) {
+	wasm := buildWasm(t)
+	host := configuredHost(scriptedFiskaly(t))
+	host.settings["tip_business_vat_treatment"] = "refuse"
+	const tipped = `{
+	  "type": "fiscal.sign.ask",
+	  "payload": {
+	    "sale_id": "sale-tip-ag",
+	    "currency": "EUR",
+	    "total": 1290,
+	    "tax_inclusive": true,
+	    "payments": [{"method": "card", "amount": 1400, "tip_amount": 110, "tip_recipient": "business"}],
+	    "vat_breakdown": [{"rate_bp": 1900, "net": 1290, "tax": 206}]
+	  }
+	}`
+	out, h := run(t, wasm, host, tipped)
+	if s := statusOf(t, out, h); s != "cannot-sign" {
+		t.Errorf("status = %q, want cannot-sign", s)
 	}
 	if len(h.calls) != 0 {
-		t.Errorf("contacted fiskaly %d times for a receipt it should have refused outright", len(h.calls))
+		t.Errorf("contacted fiskaly %d times", len(h.calls))
+	}
+}
+
+// A whole-bill discount on a mixed-rate sale now signs, split by gross:
+// €12.00 @19% + €8.00 @7%, €2.00 off → 10.80 / 7.20, paid 18.00.
+func TestFiscalSignAsk_SaleDiscountSignsApportioned(t *testing.T) {
+	wasm := buildWasm(t)
+	const discounted = `{
+	  "type": "fiscal.sign.ask",
+	  "payload": {
+	    "sale_id": "sale-disc",
+	    "currency": "EUR",
+	    "total": 1800,
+	    "tax_inclusive": true,
+	    "sale_discount": 200,
+	    "payments": [{"method": "cash", "amount": 1800}],
+	    "vat_breakdown": [{"rate_bp": 700, "net": 800, "tax": 52}, {"rate_bp": 1900, "net": 1200, "tax": 192}]
+	  }
+	}`
+	out, h := run(t, wasm, configuredHost(scriptedFiskaly(t)), discounted)
+	if s := statusOf(t, out, h); s != "approved" {
+		t.Fatalf("status = %q, want approved (logs: %v)", s, h.logs)
+	}
+	body := strings.ReplaceAll(h.calls[2].Body(), " ", "")
+	for _, want := range []string{
+		`{"vat_rate":"NORMAL","amount":"10.80"}`,
+		`{"vat_rate":"REDUCED_1","amount":"7.20"}`,
+		`{"payment_type":"CASH","amount":"18.00"}`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("finish body missing %s\nbody: %s", want, body)
+		}
 	}
 }
 
