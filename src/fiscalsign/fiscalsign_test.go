@@ -112,14 +112,18 @@ func TestVATRateBucket(t *testing.T) {
 	for _, tc := range []struct {
 		bp   int
 		want string
+		ok   bool
 	}{
-		{1900, "NORMAL"},
-		{700, "REDUCED_1"},
-		{0, "NULL"},
-		{500, "SPECIAL_RATE_1"},
+		{1900, "NORMAL", true},
+		{700, "REDUCED_1", true},
+		{1070, "SPECIAL_RATE_1", true},
+		{550, "SPECIAL_RATE_2", true},
+		{0, "NULL", true},
+		{500, "", false},
+		{1600, "", false},
 	} {
-		if got := VATRateBucket(tc.bp); got != tc.want {
-			t.Errorf("VATRateBucket(%d) = %q, want %q", tc.bp, got, tc.want)
+		if got, ok := VATRateBucket(tc.bp); got != tc.want || ok != tc.ok {
+			t.Errorf("VATRateBucket(%d) = %q, %v; want %q, %v", tc.bp, got, ok, tc.want, tc.ok)
 		}
 	}
 }

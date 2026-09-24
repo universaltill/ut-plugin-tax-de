@@ -316,3 +316,68 @@ func TestCannotSignResponse(t *testing.T) {
 		t.Fatalf("CannotSign().JSON() = %s", got)
 	}
 }
+
+// Review finding 1: a rate with no DSFinV-K bucket (a mis-set 16% tax code)
+// must be refused, never signed as if it were 10.7%.
+func TestBuildReceipt_UnknownRateRefused(t *testing.T) {
+	_, err := BuildReceipt(Request{
+		Total:        1160,
+		TaxInclusive: boolPtr(true),
+		Payments:     []Payment{{Method: "card", Amount: 1160}},
+		VATBreakdown: []VATLine{{RateBP: 1600, Net: 1160, Tax: 160}},
+	}, Options{})
+	if !errors.Is(err, ErrCannotSign) {
+		t.Fatalf("err = %v, want ErrCannotSign", err)
+	}
+}
+
+// Review finding 3: a business tip is turnover — no share of it may land in
+// NULL because the sale also has a zero-rated line.
+func TestBuildReceipt_BusinessTipSkipsZeroRatedLines(t *testing.T) {
+	r := mustBuild(t, Request{
+		Total:        2000,
+		TaxInclusive: boolPtr(true),
+		Payments:     []Payment{{Method: "card", Amount: 2100, TipAmount: 100, TipRecipient: "business"}},
+		VATBreakdown: []VATLine{{RateBP: 0, Net: 1000, Tax: 0}, {RateBP: 1900, Net: 1000, Tax: 160}},
+	}, Options{})
+	if v := vatMap(r); v["NULL"] != "10.00" || v["NORMAL"] != "11.00" {
+		t.Fatalf("VAT = %v, want NULL 10.00 / NORMAL 11.00", v)
+	}
+}
+
+func TestBuildReceipt_BusinessTipOnZeroRatedSaleRefused(t *testing.T) {
+	_, err := BuildReceipt(Request{
+		Total:        1000,
+		TaxInclusive: boolPtr(true),
+		Payments:     []Payment{{Method: "card", Amount: 1100, TipAmount: 100, TipRecipient: "business"}},
+		VATBreakdown: []VATLine{{RateBP: 0, Net: 1000, Tax: 0}},
+	}, Options{})
+	if !errors.Is(err, ErrCannotSign) {
+		t.Fatalf("err = %v, want ErrCannotSign", err)
+	}
+}
+
+func TestBuildReceipt_UnknownTipRecipientRefused(t *testing.T) {
+	_, err := BuildReceipt(Request{
+		Total:        1190,
+		TaxInclusive: boolPtr(true),
+		Payments:     []Payment{{Method: "card", Amount: 1290, TipAmount: 100, TipRecipient: "pool"}},
+		VATBreakdown: []VATLine{{RateBP: 1900, Net: 1190, Tax: 190}},
+	}, Options{})
+	if !errors.Is(err, ErrCannotSign) {
+		t.Fatalf("err = %v, want ErrCannotSign", err)
+	}
+}
+
+// tax_inclusive:true on exclusive-shaped numbers does not reconcile: refuse.
+func TestBuildReceipt_InclusiveFlagOnExclusiveNumbersRefused(t *testing.T) {
+	_, err := BuildReceipt(Request{
+		Total:        1190,
+		TaxInclusive: boolPtr(true),
+		Payments:     []Payment{{Method: "card", Amount: 1190}},
+		VATBreakdown: []VATLine{{RateBP: 1900, Net: 1000, Tax: 190}},
+	}, Options{})
+	if !errors.Is(err, ErrCannotSign) {
+		t.Fatalf("err = %v, want ErrCannotSign", err)
+	}
+}

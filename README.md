@@ -372,8 +372,8 @@ researched (with sources) on ut-docs#833:
   persisted default.
 - **Tip the business keeps** (`TrinkgeldAG` — taxable turnover, but DSFinV-K
   fixes no rate): per the `tip_business_vat_treatment` setting —
-  `proportional` (default: split across the sale's own rates like an
-  `Aufschlag`), `standard_rate` (all at 19%), or `refuse` (don't sign).
+  `proportional` (default: split across the sale's own *taxable* rates like
+  an `Aufschlag`, never into `NULL`), `standard_rate` (all at 19%), or `refuse` (don't sign).
   The merchant's Steuerberater picks; an unrecognised value is read as
   `refuse`.
 - Payments count each tip **once**, whether or not core already folded it
@@ -385,13 +385,25 @@ unsigned, prints its notice and alerts the operator — never an
 **irreversible** TSE record that misstates the sale. `NULL` has not yet
 been round-tripped through a live fiskaly sandbox (see gap 7 below).
 
-**Ordinary sales — including tax-inclusive German pricing — do sign.** The
-payload carries no `tax_inclusive` flag even though core fills
-`vat_breakdown` differently for each convention (inclusive puts the *gross*
-in `net`; exclusive puts the true net there and adds `tax` on top). The
-plugin deduces which by testing which reading reconciles with `total`.
-Reading inclusive pricing as exclusive would double-count the tax and, with
-the balance check above, refuse to sign every real German sale.
+**Ordinary sales — including tax-inclusive German pricing — do sign.** Core
+fills `vat_breakdown` differently for each convention (inclusive puts the
+*gross* in `net`; exclusive puts the true net there and adds `tax` on top).
+The plugin reads the payload's `tax_inclusive` flag (contract 1.2.0) and,
+only for an older core that doesn't send it, deduces the convention by
+testing which reading reconciles with `total`. Reading inclusive pricing as
+exclusive would double-count the tax and refuse to sign every real German
+sale.
+
+**Rates without a DSFinV-K bucket are refused.** Only 19% (`NORMAL`), 7%
+(`REDUCED_1`), 10.7% (`SPECIAL_RATE_1`), 5.5% (`SPECIAL_RATE_2`) and 0%
+(`NULL`) are signed; any other rate (e.g. a mis-set tax code) answers
+`cannot-sign` rather than being recorded under a rate it isn't.
+
+**Known residual risk (core-side, ut-docs#2571):** core does not
+yet use one convention for whether a payment's `amount` already includes
+its tip, so the plugin decides from `total`. A reader-reported tip on a
+tender that was over-paid by exactly the tip total would be read the wrong
+way round.
 
 **`handleTaxRateAsk` (dine-in/takeaway VAT switching) is real, and is the
 one piece of this plugin verified against a real wazero-compiled run** — no

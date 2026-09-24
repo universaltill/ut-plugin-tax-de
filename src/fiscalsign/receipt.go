@@ -87,10 +87,15 @@ const standardRateBP = 1900
 //   - an employee's tip (TrinkgeldAN, USt-Schlüssel 5) is not the
 //     business's turnover: it goes in the 0%/NULL bucket;
 //   - a tip the business keeps (TrinkgeldAG) is turnover, placed per
-//     Options.BusinessTip;
+//     Options.BusinessTip — proportionally across the sale's taxable
+//     rates only, never into NULL;
+//   - a rate with no DSFinV-K bucket (anything but 19/7/10.7/5.5/0%) is
+//     refused, never signed under another rate;
 //   - the payment side counts each tip exactly once, whether or not core
 //     already folded it into the payment's amount (both conventions exist
-//     in core; `total` decides which one this request uses).
+//     in core; `total` decides which one this request uses). Residual
+//     risk, until core sends one convention (ut-docs#2571): a reader-reported tip on a tender over-paid by
+//     exactly the tip total reads as "tip inside amount".
 //
 // Anything that does not reconcile returns ErrCannotSign.
 func BuildReceipt(req Request, opt Options) (Receipt, error) {
@@ -140,6 +145,10 @@ func BuildReceipt(req Request, opt Options) (Receipt, error) {
 	if businessTips > 0 {
 		switch opt.BusinessTip {
 		case "", BusinessTipProportional:
+			// Weighted by the TAXABLE rates only: a business tip is
+			// turnover, so no share of it may land in the 0%/NULL bucket
+			// (a fully zero-rated sale leaves nothing to weight by → refuse).
+			delete(saleGross, 0)
 			shares, err := apportion(businessTips, saleGross)
 			if err != nil {
 				return Receipt{}, err
@@ -160,7 +169,11 @@ func BuildReceipt(req Request, opt Options) (Receipt, error) {
 		if cents == 0 {
 			continue
 		}
-		vatBuckets[VATRateBucket(rate)] += cents
+		bucket, ok := VATRateBucket(rate)
+		if !ok {
+			return Receipt{}, fmt.Errorf("%w: VAT rate %d bp has no DSFinV-K bucket", ErrCannotSign, rate)
+		}
+		vatBuckets[bucket] += cents
 		vatSum += cents
 	}
 	for _, cents := range payBuckets {

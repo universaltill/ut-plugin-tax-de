@@ -21,7 +21,7 @@
 //     part a second provider would replace.
 //
 // Contract: ut-docs/reference/contracts/fiscal-sign-ask.md, tracking through
-// v1.6.0 (ut-docs#1203/#1404's sale_type field is the latest addition below).
+// v1.9.0 (ut-docs#833's per-payment tip_recipient is the latest addition).
 package fiscalsign
 
 import (
@@ -67,7 +67,7 @@ type VATLine struct {
 }
 
 // Request is the `fiscal.sign.ask` payload (contract v1.1.0+, currently
-// tracking v1.6.0). Money is in integer minor units throughout.
+// tracking v1.9.0). Money is in integer minor units throughout.
 type Request struct {
 	SaleID       string    `json:"sale_id"`
 	Currency     string    `json:"currency"`
@@ -132,23 +132,29 @@ func ParseRequest(raw []byte) (Request, error) {
 }
 
 // VATRateBucket maps a basis-point VAT rate to fiskaly's SIGN DE
-// standard_v1 vat_rate enum. Germany's rates today: 19% (NORMAL), 7%
-// (REDUCED_1). Anything else falls back to SPECIAL_RATE_1 rather than
-// guessing further.
+// standard_v1 vat_rate enum, which mirrors DSFinV-K's USt-Schlüssel:
+// 19% NORMAL, 7% REDUCED_1, 10.7% SPECIAL_RATE_1, 5.5% SPECIAL_RATE_2,
+// 0% NULL. ok is false for any other rate — the caller must refuse to sign
+// rather than put it in a bucket that states a different rate on an
+// irreversible record (ut-docs#833 review).
 //
 // CONFIRMED 2026-08-18 against a live sandbox: NORMAL only. REDUCED_1 /
-// NULL / SPECIAL_RATE_1 are not independently proven — no reason to expect
+// NULL / SPECIAL_RATE_* are not independently proven — no reason to expect
 // they are wrong, but they have not been exercised end to end.
-func VATRateBucket(bp int) string {
+func VATRateBucket(bp int) (string, bool) {
 	switch bp {
 	case 1900:
-		return "NORMAL"
+		return "NORMAL", true
 	case 700:
-		return "REDUCED_1"
+		return "REDUCED_1", true
+	case 1070:
+		return "SPECIAL_RATE_1", true
+	case 550:
+		return "SPECIAL_RATE_2", true
 	case 0:
-		return "NULL"
+		return "NULL", true
 	default:
-		return "SPECIAL_RATE_1"
+		return "", false
 	}
 }
 

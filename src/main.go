@@ -205,6 +205,25 @@ func setting(key string) string {
 	return string(out)
 }
 
+// businessTipTreatment reads tip_business_vat_treatment. Not set (-1)
+// means the default; any other host error reads as refuse, so a merchant's
+// configured "refuse" is never silently replaced by the signing default.
+func businessTipTreatment() fiscalsign.BusinessTipTreatment {
+	kb := []byte("tip_business_vat_treatment")
+	out, code := callBuf(func(dp, dc uint32) int32 {
+		kp, kl := ptrOf(kb)
+		return settingsGet(kp, kl, dp, dc)
+	})
+	switch {
+	case code == -1:
+		return fiscalsign.ParseBusinessTipTreatment("")
+	case code < 0:
+		logf("tax-de: reading tip_business_vat_treatment failed (host code %d) -- refusing business tips", code)
+		return fiscalsign.BusinessTipRefuse
+	}
+	return fiscalsign.ParseBusinessTipTreatment(string(out))
+}
+
 func storageRead(key string) ([]byte, bool) {
 	kb := []byte(key)
 	out, code := callBuf(func(dp, dc uint32) int32 {
@@ -549,7 +568,7 @@ func handleFiscalSignAsk(raw []byte) {
 	// the notice and alerts the operator. Same principle as never
 	// fabricating a signature.
 	receipt, err := fiscalsign.BuildReceipt(req, fiscalsign.Options{
-		BusinessTip: fiscalsign.ParseBusinessTipTreatment(setting("tip_business_vat_treatment")),
+		BusinessTip: businessTipTreatment(),
 	})
 	if err != nil {
 		logf("tax-de: fiscal.sign.ask: REFUSING to sign sale %s — %v (ut-docs#833). Answering cannot-sign.", req.SaleID, err)
