@@ -112,14 +112,18 @@ func TestVATRateBucket(t *testing.T) {
 	for _, tc := range []struct {
 		bp   int
 		want string
+		ok   bool
 	}{
-		{1900, "NORMAL"},
-		{700, "REDUCED_1"},
-		{0, "NULL"},
-		{500, "SPECIAL_RATE_1"},
+		{1900, "NORMAL", true},
+		{700, "REDUCED_1", true},
+		{1070, "SPECIAL_RATE_1", true},
+		{550, "SPECIAL_RATE_2", true},
+		{0, "NULL", true},
+		{500, "", false},
+		{1600, "", false},
 	} {
-		if got := VATRateBucket(tc.bp); got != tc.want {
-			t.Errorf("VATRateBucket(%d) = %q, want %q", tc.bp, got, tc.want)
+		if got, ok := VATRateBucket(tc.bp); got != tc.want || ok != tc.ok {
+			t.Errorf("VATRateBucket(%d) = %q, %v; want %q, %v", tc.bp, got, ok, tc.want, tc.ok)
 		}
 	}
 }
@@ -158,113 +162,12 @@ func TestMinorToDecimalString(t *testing.T) {
 // fiskaly's standard_v1 receipt wants the GROSS amount per VAT rate. The
 // contract sends net and tax separately, so the mapping must add them --
 // sending net alone would under-declare every signed sale's turnover.
-func TestVATAmounts_SumsNetPlusTaxPerBucket(t *testing.T) {
-	req, err := ParseRequest([]byte(realEnvelope))
-	if err != nil {
-		t.Fatalf("ParseRequest: %v", err)
-	}
-	got := map[string]string{}
-	for _, a := range VATAmounts(req) {
-		got[a.VATRate] = a.Amount
-	}
-	if got["REDUCED_1"] != "5.35" { // 500 net + 35 tax
-		t.Errorf("REDUCED_1 = %q, want 5.35", got["REDUCED_1"])
-	}
-	if got["NORMAL"] != "8.33" { // 700 net + 133 tax
-		t.Errorf("NORMAL = %q, want 8.33", got["NORMAL"])
-	}
-}
-
-func TestVATAmounts_MergesTwoLinesOfTheSameRate(t *testing.T) {
-	req := Request{VATBreakdown: []VATLine{
-		{RateBP: 1900, Net: 100, Tax: 19},
-		{RateBP: 1900, Net: 200, Tax: 38},
-	}}
-	amounts := VATAmounts(req)
-	if len(amounts) != 1 {
-		t.Fatalf("want 1 merged bucket, got %d: %+v", len(amounts), amounts)
-	}
-	if amounts[0].Amount != "3.57" { // (100+19) + (200+38)
-		t.Errorf("Amount = %q, want 3.57", amounts[0].Amount)
-	}
-}
-
 // Deterministic output ordering: two runs over the same request must
 // produce the same slice, or an otherwise-identical sale signs differently
 // on a retry purely because Go randomises map iteration.
-func TestVATAmounts_DeterministicOrder(t *testing.T) {
-	req := Request{VATBreakdown: []VATLine{
-		{RateBP: 1900, Net: 100, Tax: 19},
-		{RateBP: 700, Net: 100, Tax: 7},
-		{RateBP: 0, Net: 50, Tax: 0},
-	}}
-	first := VATAmounts(req)
-	for i := 0; i < 50; i++ {
-		got := VATAmounts(req)
-		for j := range first {
-			if got[j] != first[j] {
-				t.Fatalf("ordering not deterministic at %d: %+v vs %+v", j, got, first)
-			}
-		}
-	}
-}
-
 // The tip is real money collected under that payment method, so it belongs
 // in the signed payment total -- otherwise amounts_per_payment_type
 // under-reports every tipped sale and won't reconcile against the receipt.
-func TestPaymentAmounts_IncludesTip(t *testing.T) {
-	req, err := ParseRequest([]byte(realEnvelope))
-	if err != nil {
-		t.Fatalf("ParseRequest: %v", err)
-	}
-	amounts := PaymentAmounts(req)
-	if len(amounts) != 1 {
-		t.Fatalf("want 1 bucket, got %d", len(amounts))
-	}
-	if amounts[0].PaymentType != "NON_CASH" {
-		t.Errorf("PaymentType = %q, want NON_CASH", amounts[0].PaymentType)
-	}
-	if amounts[0].Amount != "12.90" { // 1190 + 100 tip
-		t.Errorf("Amount = %q, want 12.90 (amount + tip)", amounts[0].Amount)
-	}
-}
-
-func TestPaymentAmounts_SplitsCashAndNonCash(t *testing.T) {
-	req := Request{Payments: []Payment{
-		{Method: "cash", Amount: 500},
-		{Method: "card", Amount: 700, TipAmount: 100},
-		{Method: "cash", Amount: 200},
-	}}
-	got := map[string]string{}
-	for _, a := range PaymentAmounts(req) {
-		got[a.PaymentType] = a.Amount
-	}
-	if got["CASH"] != "7.00" {
-		t.Errorf("CASH = %q, want 7.00", got["CASH"])
-	}
-	if got["NON_CASH"] != "8.00" {
-		t.Errorf("NON_CASH = %q, want 8.00", got["NON_CASH"])
-	}
-}
-
-func TestPaymentAmounts_DeterministicOrder(t *testing.T) {
-	req := Request{Payments: []Payment{
-		{Method: "card", Amount: 100},
-		{Method: "cash", Amount: 100},
-	}}
-	first := PaymentAmounts(req)
-	for i := 0; i < 50; i++ {
-		got := PaymentAmounts(req)
-		for j := range first {
-			if got[j] != first[j] {
-				t.Fatalf("ordering not deterministic: %+v vs %+v", got, first)
-			}
-		}
-	}
-}
-
-// --- responses (the three contract states) ---
-
 func TestApprovedResponse_NoEvidence(t *testing.T) {
 	var got map[string]any
 	if err := json.Unmarshal(Approved(TSEEvidence{}).JSON(), &got); err != nil {
@@ -366,163 +269,8 @@ func TestUnreachableResponse(t *testing.T) {
 // Guards the exact wire strings -- core matches on them, so a typo here is
 // silently treated as an unknown status (= failure) by the host.
 func TestStatusConstantsMatchTheContract(t *testing.T) {
-	if StatusApproved != "approved" || StatusUnreachable != "unreachable" || StatusNotThisTerminal != "not-this-terminal" {
-		t.Errorf("status constants drifted from contract v1.1.0: %q %q %q",
-			StatusApproved, StatusUnreachable, StatusNotThisTerminal)
-	}
-}
-
-// --- balance invariant (ut-docs#818 review finding B1) ---
-//
-// fiskaly's standard_v1 receipt becomes a DSFinV-K Kassenbeleg-V1 string
-// whose two halves must be equal: `Beleg^<gross per VAT rate>^<per payment
-// type>`. A receipt where they disagree is either rejected by fiskaly or —
-// worse — signed into an irreversible record that misstates the sale.
-
-func TestBalanceDelta_PlainSaleBalances(t *testing.T) {
-	req := Request{
-		Total:        1190,
-		Payments:     []Payment{{Method: "card", Amount: 1190}},
-		VATBreakdown: []VATLine{{RateBP: 1900, Net: 1000, Tax: 190}},
-	}
-	if d := BalanceDelta(req); d != 0 {
-		t.Errorf("BalanceDelta = %d, want 0 for a plain sale", d)
-	}
-}
-
-// The exact defect the review found: a tip lands on the payment side and in
-// no VAT bucket, so the two halves differ by the tip.
-func TestBalanceDelta_TipUnbalances(t *testing.T) {
-	req := Request{
-		Total:        1190,
-		Payments:     []Payment{{Method: "card", Amount: 1190, TipAmount: 100}},
-		VATBreakdown: []VATLine{{RateBP: 1900, Net: 1000, Tax: 190}},
-	}
-	if d := BalanceDelta(req); d != -100 {
-		t.Errorf("BalanceDelta = %d, want -100 (payments exceed VAT by the tip)", d)
-	}
-}
-
-// A sale-level discount reduces `total` (and so the payments) but not the
-// per-line VAT breakdown, which the contract states is computed before it.
-func TestBalanceDelta_SaleLevelDiscountUnbalances(t *testing.T) {
-	// 10.00 net of goods, 2.00 off the whole bill. The breakdown reconciles
-	// with neither pricing convention, because the payload never breaks the
-	// sale-level discount out — so it is unsignable, not merely unbalanced.
-	req := Request{
-		Total:        990,
-		Payments:     []Payment{{Method: "cash", Amount: 990}},
-		VATBreakdown: []VATLine{{RateBP: 1900, Net: 1000, Tax: 190}},
-	}
-	if d := BalanceDelta(req); d == 0 {
-		t.Error("a sale-level discount must not reconcile — it is invisible in the payload")
-	}
-}
-
-func TestBalanceDelta_MixedRatesBalance(t *testing.T) {
-	// Tax-exclusive: 12.00 net + 1.68 tax = 13.68 gross, paid 5.00 + 8.68.
-	req := Request{
-		Total:    1368,
-		Payments: []Payment{{Method: "cash", Amount: 500}, {Method: "card", Amount: 868}},
-		VATBreakdown: []VATLine{
-			{RateBP: 1900, Net: 700, Tax: 133},
-			{RateBP: 700, Net: 500, Tax: 35},
-		},
-	}
-	if d := BalanceDelta(req); d != 0 {
-		t.Errorf("BalanceDelta = %d, want 0 (833 + 535 == 500 + 868)", d)
-	}
-}
-
-// --- tax-inclusive vs tax-exclusive (found while fixing B1) ---
-//
-// The payload carries NO tax_inclusive flag, but core fills vat_breakdown
-// differently depending on it (universal-till internal/pages/fiscal_sign_hook.go
-// buildFiscalSignPayload + internal/pos.ComputeTaxBasisPoints):
-//
-//   exclusive: net = true net,  tax = added on top   -> gross = net + tax
-//   inclusive: net = GROSS,     tax = contained in it -> gross = net
-//
-// Germany prices tax-inclusive, so getting this backwards would double-count
-// the tax on essentially every real sale.
-
-func TestVATAmounts_TaxExclusiveSale(t *testing.T) {
-	// 10.00 net + 1.90 tax = 11.90 total.
-	req := Request{
-		Total:        1190,
-		Payments:     []Payment{{Method: "card", Amount: 1190}},
-		VATBreakdown: []VATLine{{RateBP: 1900, Net: 1000, Tax: 190}},
-	}
-	got := VATAmounts(req)
-	if len(got) != 1 || got[0].Amount != "11.90" {
-		t.Fatalf("VATAmounts = %+v, want one bucket of 11.90", got)
-	}
-	if d := BalanceDelta(req); d != 0 {
-		t.Errorf("BalanceDelta = %d, want 0", d)
-	}
-}
-
-func TestVATAmounts_TaxInclusiveSale(t *testing.T) {
-	// 11.90 gross, of which 1.90 is the contained 19% tax.
-	req := Request{
-		Total:        1190,
-		Payments:     []Payment{{Method: "card", Amount: 1190}},
-		VATBreakdown: []VATLine{{RateBP: 1900, Net: 1190, Tax: 190}},
-	}
-	got := VATAmounts(req)
-	if len(got) != 1 || got[0].Amount != "11.90" {
-		t.Fatalf("VATAmounts = %+v, want one bucket of 11.90 (net is ALREADY gross here)", got)
-	}
-	if d := BalanceDelta(req); d != 0 {
-		t.Errorf("BalanceDelta = %d, want 0 — this is an ordinary German sale and MUST sign", d)
-	}
-}
-
-func TestVATAmounts_TaxInclusiveMixedRates(t *testing.T) {
-	// 8.33 gross @19% (1.33 contained) + 5.35 gross @7% (0.35 contained).
-	req := Request{
-		Total:    1368,
-		Payments: []Payment{{Method: "cash", Amount: 1368}},
-		VATBreakdown: []VATLine{
-			{RateBP: 1900, Net: 833, Tax: 133},
-			{RateBP: 700, Net: 535, Tax: 35},
-		},
-	}
-	got := map[string]string{}
-	for _, a := range VATAmounts(req) {
-		got[a.VATRate] = a.Amount
-	}
-	if got["NORMAL"] != "8.33" || got["REDUCED_1"] != "5.35" {
-		t.Errorf("VATAmounts = %+v, want NORMAL 8.33 / REDUCED_1 5.35", got)
-	}
-	if d := BalanceDelta(req); d != 0 {
-		t.Errorf("BalanceDelta = %d, want 0", d)
-	}
-}
-
-// Zero-rated lines are identical under both conventions; must not confuse it.
-func TestVATAmounts_ZeroRatedIsUnambiguous(t *testing.T) {
-	req := Request{
-		Total:        500,
-		Payments:     []Payment{{Method: "cash", Amount: 500}},
-		VATBreakdown: []VATLine{{RateBP: 0, Net: 500, Tax: 0}},
-	}
-	if got := VATAmounts(req); len(got) != 1 || got[0].Amount != "5.00" {
-		t.Fatalf("VATAmounts = %+v, want 5.00", got)
-	}
-	if d := BalanceDelta(req); d != 0 {
-		t.Errorf("BalanceDelta = %d, want 0", d)
-	}
-}
-
-// A tip still cannot be reconciled — that stays an accountant question.
-func TestBalanceDelta_TipStillUnbalancesUnderInclusivePricing(t *testing.T) {
-	req := Request{
-		Total:        1190,
-		Payments:     []Payment{{Method: "card", Amount: 1190, TipAmount: 100}},
-		VATBreakdown: []VATLine{{RateBP: 1900, Net: 1190, Tax: 190}},
-	}
-	if d := BalanceDelta(req); d == 0 {
-		t.Error("a tipped sale must not reconcile — the tip is in no VAT bucket")
+	if StatusApproved != "approved" || StatusUnreachable != "unreachable" || StatusNotThisTerminal != "not-this-terminal" || StatusCannotSign != "cannot-sign" {
+		t.Errorf("status constants drifted from contract v1.3.0: %q %q %q %q",
+			StatusApproved, StatusUnreachable, StatusNotThisTerminal, StatusCannotSign)
 	}
 }

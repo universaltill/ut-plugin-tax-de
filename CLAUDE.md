@@ -58,24 +58,19 @@ round-trips per sale). Core now owns the whole failure surface properly
 `retry: true` — so a private retry loop was redundant as well as harmful.
 **Do not re-add `sale.completed` for signing.**
 
-**The plugin REFUSES to sign a receipt it cannot reconcile**
-(`fiscalsign.BalanceDelta`). fiskaly renders `standard_v1` into DSFinV-K's
-`Beleg^<gross per VAT rate>^<per payment type>`, whose halves must be
-equal. Two cases cannot be reconciled from the payload:
+**The plugin signs only a receipt whose halves agree**
+(`fiscalsign.BuildReceipt`, ut-docs#833). fiskaly renders `standard_v1`
+into DSFinV-K's `Beleg^<gross per VAT rate>^<per payment type>`, whose
+halves must be equal. A whole-bill discount is split across rates by gross
+(Rabatt); an employee tip goes in `NULL` (TrinkgeldAN); a business tip
+follows the `tip_business_vat_treatment` setting (TrinkgeldAG); service
+charge is already in `vat_breakdown`. Anything else that doesn't reconcile
+answers **`cannot-sign`** — a TSE signature is irreversible. Don't add a
+treatment without the research on ut-docs#833 behind it.
 
-- a **tip** — it rides the payment side and sits in no VAT bucket;
-- a **sale-level discount or service charge** — core moves `total` by it but
-  `vat_breakdown` is per-line and pre-both, and the payload never breaks it
-  out.
-
-Those sales do NOT sign; they take core's declared-and-retried path.
-**This is not a bug to fix by picking a VAT bucket** — the tip treatment is
-an open accountant question (ut-docs#833) and the missing payload fields are
-ut-docs#834. A TSE signature is irreversible, so declaring a gap beats an
-irreversible false record.
-
-**Tax-inclusive vs tax-exclusive is INFERRED, and getting it wrong is
-catastrophic.** The payload has no `tax_inclusive` flag, but core fills
+**Tax-inclusive vs tax-exclusive: read `tax_inclusive` (contract 1.2.0),
+else INFER — getting it wrong is catastrophic.** A pre-1.2.0 core sends no
+flag, but core fills
 `vat_breakdown` differently depending on it (`buildFiscalSignPayload` +
 `pos.ComputeTaxBasisPoints`):
 
@@ -84,8 +79,8 @@ catastrophic.** The payload has no `tax_inclusive` flag, but core fills
 | exclusive | true net | `net + tax` |
 | **inclusive** (German norm) | **already the gross** | **`net`** |
 
-`fiscalsign.taxInclusive` deduces which by testing that reconciles against
-`total`, which is authoritative — not a guess, and zero-rated lines give the
+`fiscalsign.BuildReceipt` uses the flag when present, else deduces which
+reading reconciles against `total` (after the sale discount), which is authoritative — not a guess, and zero-rated lines give the
 same answer either way. An earlier draft of this code assumed exclusive
 unconditionally; combined with the balance check that would have **refused
 to sign every ordinary German sale**, which is worse than the bug it fixed.
@@ -138,18 +133,6 @@ round-trips per sale). Core now owns the whole failure surface properly
 `retry: true` — so a private retry loop was redundant as well as harmful.
 **Do not re-add `sale.completed` for signing.**
 
-**The plugin REFUSES to sign an unbalanced receipt** (`fiscalsign.BalanceDelta`).
-fiskaly renders `standard_v1` into DSFinV-K's `Beleg^<gross per VAT
-rate>^<per payment type>`, whose halves must be equal — but a tip rides the
-payment side with no VAT bucket, and a sale-level discount/service charge
-moves `total` without moving the per-line `vat_breakdown`. So tipped and
-whole-bill-discounted sales currently do NOT sign, by design; they take
-core's declared-and-retried path instead. **This is not a bug to fix by
-picking a VAT bucket** — the correct German representation is an open
-accountant question (ut-docs#833). A TSE signature is irreversible, so
-signing a receipt already known to misstate the sale is worse than
-declaring the gap. Same rule as never fabricating a signature.
-
 DSFinV-K export is unchanged and still fully unverified — every endpoint
 in `src/main.go` for it is grounded in fiskaly's **public** documentation
 (developer.fiskaly.com, kassensichv.net) but flagged
@@ -189,10 +172,10 @@ blocks on connectivity (ADR-0003 intact). The private queue is gone.
    a real 2xx carrying a real `signature.value`. Don't add a path that
    marks a sale signed without one.
 2. **Never sign a receipt already known to be wrong.** If the VAT side and
-   the payment side don't balance, refuse and answer `unreachable`. A TSE
-   signature cannot be corrected afterwards, so a declared gap beats an
-   irreversible false record. See `fiscalsign.BalanceDelta` and
-   ut-docs#833.
+   the payment side can't be made to balance, refuse and answer
+   `cannot-sign`. A TSE signature cannot be corrected afterwards, so a
+   declared gap beats an irreversible false record. See
+   `fiscalsign.BuildReceipt` and ut-docs#833.
 
 ## `export` canonical type has no host dispatcher yet
 
@@ -258,7 +241,7 @@ Known gaps #5/#6/#7.
   future config-selected second provider would replace. **Three invariants
   are pinned by tests and must not regress**: the amount signed per VAT
   bucket is GROSS (`net + tax`, not net — sending net under-declares every
-  sale), a payment's tip is included in its signed total, and `sale_type`
+  sale), a payment's tip is counted exactly once in its signed total, and `sale_type`
   ("sale"/"return", contract 1.6.0, ut-docs#1404) reaches `signTransaction`
   and selects a distinct fiskaly `receipt_type` (`RECEIPT` vs
   `RECEIPT_0104`) — the field existed and the branch was already written

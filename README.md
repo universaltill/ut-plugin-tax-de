@@ -27,7 +27,7 @@ vs. "researched, not tested":
 | DSFinV-K export format/content is legally compliant | **Not verified, at all.** No DSFinV-K output from this plugin has been checked against the DSFinV-K spec or a real tax audit. |
 | KassenSichV compliance overall | **Not certified.** This is a starting skeleton. A merchant must get real legal/tax-advisor sign-off before relying on this for a live business — this plugin existing does not make a till KassenSichV-compliant. |
 | `go build ./...` / `scripts/build.sh` | **Confirmed** — builds clean as of this commit (see CI). |
-| End-to-end behavior against the till's real event bus | **Partially verified, and now covered by a committed test suite** (`src/wasmrun`, 2026-08-19). The `fiscal.sign.ask` path is exercised against the REAL compiled `plugin.wasm` in a real wazero runtime (same engine `universal-till` uses) with stubbed host functions: event dispatch, settings lookup, the auth→start(`tx_revision=1`)→finish(`tx_revision=2`) call order, the exact money in the signed body, the full §6 evidence (RFC3339 timestamps, not raw epochs), and the exact stdout JSON for the approved path plus four failure paths (fiskaly 5xx, unconfigured, malformed payload, unbalanced receipt). Proven to bite: deleting the dispatch, dropping `tax` from the VAT gross, or answering `approved` without a signature each fail it. Still NOT proven: `universal-till`'s actual host-function implementations, a real installed-plugin flow through the till UI, and the HTTP layer here is a stub rather than live fiskaly — the two halves are each verified, their combination is not. |
+| End-to-end behavior against the till's real event bus | **Partially verified, and now covered by a committed test suite** (`src/wasmrun`, 2026-08-19). The `fiscal.sign.ask` path is exercised against the REAL compiled `plugin.wasm` in a real wazero runtime (same engine `universal-till` uses) with stubbed host functions: event dispatch, settings lookup, the auth→start(`tx_revision=1`)→finish(`tx_revision=2`) call order, the exact money in the signed body, the full §6 evidence (RFC3339 timestamps, not raw epochs), and the exact stdout JSON for the approved path plus failure paths (fiskaly 5xx, unconfigured, malformed payload, unbalanced receipt → `cannot-sign`, business tip with the setting at `refuse`) and the tipped/discounted sales that now sign. Proven to bite: deleting the dispatch, dropping `tax` from the VAT gross, or answering `approved` without a signature each fail it. Still NOT proven: `universal-till`'s actual host-function implementations, a real installed-plugin flow through the till UI, and the HTTP layer here is a stub rather than live fiskaly — the two halves are each verified, their combination is not. |
 | `sale_type` ("sale"/"return") reaches signing and selects a distinct `receipt_type` | **Wiring CONFIRMED 2026-09-03** (ut-docs#1404): `fiscalsign.Request.SaleType`/`IsReturn()` are unit-tested (`src/fiscalsign`), and `src/wasmrun`'s `TestFiscalSignAsk_ReturnSignsWithDistinctReceiptType` runs the compiled plugin twice against otherwise-identical payloads differing only in `sale_type`, asserting the two signed bodies use different `receipt_type` values (`RECEIPT` vs `RECEIPT_0104`). This closes the "does core's signal reach the branch at all" gap (it didn't, before this: `signInput.SaleType` existed and `signTransaction` already branched on it, but nothing ever populated it, so the branch was permanently dead). **Two things this does NOT confirm, both flagged `NEEDS SANDBOX VERIFICATION` in `src/main.go`'s doc comment:** whether `RECEIPT_0104` is actually fiskaly's real return-receipt code, and whether fiskaly expects a return's `amounts_per_vat_rate`/`amounts_per_payment_type` as the same positive magnitudes a sale carries (distinguished purely by `receipt_type`, which is what this plugin sends today, matching core's own contract) or as negative amounts — if fiskaly's real schema wants the latter, a return is still recorded as positive turnover today, just correctly labeled `RECEIPT_0104` instead of `RECEIPT`. **Does NOT yet pick the right receipt_type in the sense of "verified correct against fiskaly"** — it picks the receipt_type this plugin's own code has (unverified) decided is right. |
 | DATEV EXTF file structure (31-field header row 1, 125-column header row 2, semicolon-delimited, Windows-1252, CRLF) | **Confirmed against a real reference file** (github.com/ledermann/datev's `EXTF_Buchungsstapel.csv`, byte-verified 2026-08-01), not reconstructed from memory — see `src/datev/datev.go`'s package doc comment. An independent review caught an early draft undercounting header row 1's trailing fields (27 vs. the real 31); fixed and pinned by `TestHeader1_FieldCount`. Unit-tested (`go test ./src/datev/...`), including a Windows-1252 round-trip check on the umlaut/en-dash header text. |
 | DATEV format-version numbers (`700`/`21`/`13`) and Soll/Haben booking convention (Kasse debited, Erlöskonto credited via an Automatikkonto, no BU-Schlüssel by default) | **Researched, not confirmed against DATEV's current published spec** (developer.datev.de 403'd when fetched) or a real accountant/DATEV import. Matches the reference file and common SKR03/04 practice, but NEEDS ACCOUNTANT VERIFICATION before a real filing. |
@@ -355,25 +355,55 @@ every *successfully signed* sale was immediately re-signed against the same
 had its `tse_result:*` audit record overwritten from signed to failed, and
 added a permanent queue entry.
 
-**Two sales that will NOT sign today, deliberately.** A sale carrying a
-**tip**, or a **sale-level discount / service charge**, produces a receipt
-whose two halves cannot be reconciled (fiskaly renders `standard_v1` into
-DSFinV-K's `Beleg^<gross per VAT rate>^<per payment type>`, and those must
-be equal — a tip has no VAT bucket, and a whole-bill discount moves the
-total but not the per-line breakdown, which the payload never breaks out).
-The plugin refuses to sign such a receipt and answers `unreachable`, so the
-sale completes, is marked unsigned, prints the outage notice and is retried
-— rather than writing an **irreversible** TSE record that misstates the
-sale. Tip treatment is an open accountant question (**ut-docs#833**); the
-missing payload fields are **ut-docs#834**.
+**Tips and whole-bill discounts sign, with a balanced receipt (v0.7.0,
+ut-docs#833).** fiskaly renders `standard_v1` into DSFinV-K's
+`Beleg^<gross per VAT rate>^<per payment type>`, and those halves must be
+equal. `fiscalsign.BuildReceipt` makes them equal using the treatments
+researched (with sources) on ut-docs#833:
 
-**Ordinary sales — including tax-inclusive German pricing — do sign.** The
-payload carries no `tax_inclusive` flag even though core fills
-`vat_breakdown` differently for each convention (inclusive puts the *gross*
-in `net`; exclusive puts the true net there and adds `tax` on top). The
-plugin deduces which by testing which reading reconciles with `total`.
-Reading inclusive pricing as exclusive would double-count the tax and, with
-the balance check above, refuse to sign every real German sale.
+- **Whole-bill discount** (DSFinV-K `Rabatt`, UStAE 10.3): split across the
+  sale's VAT rates in proportion to each rate's gross — floors, remainder on
+  the highest rate — the contract's and core's own VAT-invoice convention.
+- **Service charge**: already inside `vat_breakdown` (core, contract 1.5.0);
+  never applied twice.
+- **Tip to the employee** (`TrinkgeldAN`, USt-Schlüssel 5 — not the
+  business's turnover): in the 0% `NULL` bucket. This is the default for a
+  tip with no `tip_recipient` (a pre-1.9.0 core), matching core's own
+  persisted default.
+- **Tip the business keeps** (`TrinkgeldAG` — taxable turnover, but DSFinV-K
+  fixes no rate): per the `tip_business_vat_treatment` setting —
+  `proportional` (default: split across the sale's own *taxable* rates like
+  an `Aufschlag`, never into `NULL`), `standard_rate` (all at 19%), or `refuse` (don't sign).
+  The merchant's Steuerberater picks; an unrecognised value is read as
+  `refuse`.
+- Payments count each tip **once**, whether or not core already folded it
+  into the payment's `amount` — `total` decides which.
+
+Anything that still does not reconcile is refused with **`cannot-sign`**
+(contract 1.3.0; previously `unreachable`): the sale completes, is marked
+unsigned, prints its notice and alerts the operator — never an
+**irreversible** TSE record that misstates the sale. `NULL` has not yet
+been round-tripped through a live fiskaly sandbox (see gap 7 below).
+
+**Ordinary sales — including tax-inclusive German pricing — do sign.** Core
+fills `vat_breakdown` differently for each convention (inclusive puts the
+*gross* in `net`; exclusive puts the true net there and adds `tax` on top).
+The plugin reads the payload's `tax_inclusive` flag (contract 1.2.0) and,
+only for an older core that doesn't send it, deduces the convention by
+testing which reading reconciles with `total`. Reading inclusive pricing as
+exclusive would double-count the tax and refuse to sign every real German
+sale.
+
+**Rates without a DSFinV-K bucket are refused.** Only 19% (`NORMAL`), 7%
+(`REDUCED_1`), 10.7% (`SPECIAL_RATE_1`), 5.5% (`SPECIAL_RATE_2`) and 0%
+(`NULL`) are signed; any other rate (e.g. a mis-set tax code) answers
+`cannot-sign` rather than being recorded under a rate it isn't.
+
+**Known residual risk (core-side, ut-docs#2571):** core does not
+yet use one convention for whether a payment's `amount` already includes
+its tip, so the plugin decides from `total`. A reader-reported tip on a
+tender that was over-paid by exactly the tip total would be read the wrong
+way round.
 
 **`handleTaxRateAsk` (dine-in/takeaway VAT switching) is real, and is the
 one piece of this plugin verified against a real wazero-compiled run** — no
@@ -406,6 +436,11 @@ independent of the wasm-level check.
   fiskaly accounts share one id across both APIs, some don't; verify
   against the merchant's account).
 - `dsfinvk_export_format` — `zip` (default) or `tar`.
+- `tip_business_vat_treatment` — how a tip the **business** keeps
+  (`TrinkgeldAG`) is placed on the TSE-signed receipt: `proportional`
+  (default), `standard_rate` or `refuse`. An employee's tip is always
+  `NULL` (not taxable) and needs no setting. See "Tips and whole-bill
+  discounts" above; ut-docs#833.
 - `takeaway_rate_overrides` — JSON object, tax_code_id → basis points, e.g.
   `{"tax-drink-de": 700}` for a drinks tax code that should be 7% on
   takeaway. Edited as raw JSON — there is no dedicated form for this yet
@@ -507,10 +542,10 @@ with any chart once every method/rate that appears is covered.
    — **done for TSE signing** (2026-08-19, ut-docs#818): `src/wasmrun` is a
    committed wazero suite over the real compiled wasm. **Still open for
    DSFinV-K**, which remains entirely unexercised.
-6. **Get an accountant's ruling on tips and whole-bill discounts**
-   (**ut-docs#833**) and then represent them on the signed receipt. Until
-   that lands, those sales deliberately do not sign — see above. This is
-   the single biggest functional gap in TSE signing today.
+6. ~~**Represent tips and whole-bill discounts on the signed receipt**~~ —
+   **done in v0.7.0** (ut-docs#833), from published research rather than a
+   ruling; the pilot's Steuerberater confirms the `tip_business_vat_treatment`
+   setting (see above).
 7. **Verify the remaining VAT buckets against the sandbox.** Only `NORMAL`
    has been exercised live; `REDUCED_1` / `NULL` / `SPECIAL_RATE_1` are
    unit-tested for mapping but never round-tripped through fiskaly.
