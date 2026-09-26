@@ -137,6 +137,12 @@ type SignEvidence struct {
 	LogTime            string // RFC3339
 	Signature          string
 	SignatureAlgorithm string
+	// QRCodeData is fiskaly's own receipt QR string (`qr_code_data`, the
+	// DSFinV-K/BSI TR-03153 "V0;<client serial>;<process type>;<process
+	// data>;<tx>;<counter>;<start>;<end>;<alg>;<time format>;<signature>;
+	// <public key>" format), kept VERBATIM — never re-assembled from the
+	// fields above (ut-docs#2880). Empty when the body carries none.
+	QRCodeData string
 }
 
 // ParseSignEvidence extracts every evidence field a §6 receipt needs from a
@@ -153,6 +159,7 @@ type SignEvidence struct {
 //	signature.value       → Signature
 //	signature.counter     → SignatureCounter
 //	signature.algorithm   → SignatureAlgorithm
+//	qr_code_data          → QRCodeData     (verbatim, ut-docs#2880)
 //
 // Every field is independently optional: an absent one stays zero rather
 // than failing the whole parse, matching the contract's "every tse field is
@@ -171,11 +178,13 @@ func ParseSignEvidence(body []byte) SignEvidence {
 		Log struct {
 			Timestamp json.RawMessage `json:"timestamp"`
 		} `json:"log"`
+		QRCodeData string `json:"qr_code_data"`
 	}
 	if err := json.Unmarshal(body, &r); err != nil {
 		return SignEvidence{}
 	}
 	ev := SignEvidence{
+		QRCodeData:         r.QRCodeData,
 		TransactionNumber:  r.Number,
 		SignatureCounter:   r.Signature.Counter,
 		SerialNumber:       r.TSSSerialNumber,

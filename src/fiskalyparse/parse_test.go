@@ -185,3 +185,21 @@ func TestParseSignEvidence_Garbage(t *testing.T) {
 		t.Errorf("garbage must yield no signature, got %+v", ev)
 	}
 }
+
+// ut-docs#2880: fiskaly's own receipt QR string (qr_code_data, the
+// DSFinV-K/BSI "V0;…" format) is taken VERBATIM from the real sandbox body —
+// never re-assembled from the other fields.
+func TestParseSignEvidence_RealFixtureCarriesQRCodeDataVerbatim(t *testing.T) {
+	ev := ParseSignEvidence([]byte(realFinishedTransactionBody))
+	const want = "V0;UT-TEST-101bd1cd-286c-4c3b-9ae5-43d4fad02f08;Kassenbeleg-V1;Beleg^4.20_0.00_0.00_0.00_0.00^4.20:Unbar;1;27;2026-08-18T18:38:19.000Z;2026-08-18T18:38:19.000Z;ecdsa-plain-SHA256;unixTime;kHCYf4/f/zz+51m5XlzLtuEOFvVyAF3wrzsz+p+iyQcxzICkza8O9m/P45pRDQRWwEvxYzYZQWR3wGqEsSf2iA==;BAVHkwS3tptbKRK2Z8E6a8u8N/Qkw/6gBr89NivYZciYJVpF5uQPQTpgb64I3STVhUpLVc/ZCZOz7eaBol+qUnY="
+	if ev.QRCodeData != want {
+		t.Errorf("QRCodeData = %q\nwant verbatim %q", ev.QRCodeData, want)
+	}
+}
+
+// No qr_code_data on the body → empty, never a placeholder or a guess.
+func TestParseSignEvidence_MissingQRCodeDataStaysEmpty(t *testing.T) {
+	if ev := ParseSignEvidence([]byte(`{"signature":{"value":"SIG=="}}`)); ev.QRCodeData != "" {
+		t.Errorf("QRCodeData = %q, want empty", ev.QRCodeData)
+	}
+}
