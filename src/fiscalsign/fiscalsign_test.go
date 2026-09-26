@@ -2,6 +2,7 @@ package fiscalsign
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 )
 
@@ -272,5 +273,56 @@ func TestStatusConstantsMatchTheContract(t *testing.T) {
 	if StatusApproved != "approved" || StatusUnreachable != "unreachable" || StatusNotThisTerminal != "not-this-terminal" || StatusCannotSign != "cannot-sign" {
 		t.Errorf("status constants drifted from contract v1.3.0: %q %q %q %q",
 			StatusApproved, StatusUnreachable, StatusNotThisTerminal, StatusCannotSign)
+	}
+}
+
+// ut-docs#2880 (contract 1.10.0): the approved answer carries fiskaly's
+// receipt QR string verbatim as receipt.qr_payload.
+func TestApprovedResponse_WithReceiptQRCarriesPayloadVerbatim(t *testing.T) {
+	const qr = "V0;client;Kassenbeleg-V1;Beleg^4.20_0.00_0.00_0.00_0.00^4.20:Unbar;1;27;2026-08-18T18:38:19.000Z;2026-08-18T18:38:19.000Z;ecdsa-plain-SHA256;unixTime;SIG==;PUB="
+	var got struct {
+		Status  string `json:"status"`
+		Receipt *struct {
+			QRPayload string   `json:"qr_payload"`
+			Lines     []string `json:"lines"`
+		} `json:"receipt"`
+	}
+	if err := json.Unmarshal(Approved(TSEEvidence{Signature: "SIG=="}).WithReceiptQR(qr).JSON(), &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if got.Status != StatusApproved || got.Receipt == nil || got.Receipt.QRPayload != qr {
+		t.Fatalf("got %+v, want approved with receipt.qr_payload verbatim", got)
+	}
+	if got.Receipt.Lines != nil {
+		t.Errorf("lines = %v, want omitted", got.Receipt.Lines)
+	}
+}
+
+// Missing qr_code_data → no receipt object at all (never a placeholder);
+// over the contract's 1 KiB bound → omitted (core would drop it anyway);
+// never attached to a non-approved answer.
+func TestApprovedResponse_WithReceiptQROmittedWhenUnusable(t *testing.T) {
+	cases := map[string][]byte{
+		"empty payload":     Approved(TSEEvidence{Signature: "S"}).WithReceiptQR("").JSON(),
+		"blank payload":     Approved(TSEEvidence{Signature: "S"}).WithReceiptQR("   ").JSON(),
+		"oversize payload":  Approved(TSEEvidence{Signature: "S"}).WithReceiptQR(strings.Repeat("Q", ReceiptQRMaxBytes+1)).JSON(),
+		"unreachable":       Unreachable().WithReceiptQR("V0;x").JSON(),
+		"cannot-sign":       CannotSign().WithReceiptQR("V0;x").JSON(),
+		"not-this-terminal": NotThisTerminal().WithReceiptQR("V0;x").JSON(),
+	}
+	for name, raw := range cases {
+		var got map[string]any
+		if err := json.Unmarshal(raw, &got); err != nil {
+			t.Fatalf("%s: unmarshal: %v", name, err)
+		}
+		if _, present := got["receipt"]; present {
+			t.Errorf("%s: receipt must be omitted, got %s", name, raw)
+		}
+	}
+	// Exactly at the bound is kept.
+	var got map[string]any
+	_ = json.Unmarshal(Approved(TSEEvidence{Signature: "S"}).WithReceiptQR(strings.Repeat("Q", ReceiptQRMaxBytes)).JSON(), &got)
+	if _, present := got["receipt"]; !present {
+		t.Error("a payload exactly at the bound must be kept")
 	}
 }

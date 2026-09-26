@@ -274,6 +274,17 @@ const finishedResponse = `{
   "tss_serial_number": "TSS-SERIAL-9d5e",
   "time_start": 1755253860,
   "signature": {"value": "MEQCIFakeSignature==", "counter": 12345, "algorithm": "ecdsa-plain-SHA256"},
+  "log": {"timestamp": 1755253862, "timestamp_format": "unixTime"},
+  "qr_code_data": "V0;UT-TEST-client;Kassenbeleg-V1;Beleg^13.68_0.00_0.00_0.00_0.00^13.68:Unbar;4711;12345;2025-08-15T10:31:00.000Z;2025-08-15T10:31:02.000Z;ecdsa-plain-SHA256;unixTime;MEQCIFakeSignature==;BPubKey="
+}`
+
+// finishedResponseNoQR is finishedResponse without fiskaly's qr_code_data.
+const finishedResponseNoQR = `{
+  "number": 4711,
+  "state": "FINISHED",
+  "tss_serial_number": "TSS-SERIAL-9d5e",
+  "time_start": 1755253860,
+  "signature": {"value": "MEQCIFakeSignature==", "counter": 12345, "algorithm": "ecdsa-plain-SHA256"},
   "log": {"timestamp": 1755253862, "timestamp_format": "unixTime"}
 }`
 
@@ -811,4 +822,59 @@ func keysOf(m map[string][]byte) []string {
 		out = append(out, k)
 	}
 	return out
+}
+
+// ut-docs#2880: the compiled plugin passes fiskaly's qr_code_data through
+// VERBATIM as the contract 1.10.0 receipt.qr_payload — core renders the QR
+// from it and no longer invents one.
+func TestFiscalSignAsk_ReceiptQRPayloadIsFiskalyQRCodeDataVerbatim(t *testing.T) {
+	wasm := buildWasm(t)
+	out, h := run(t, wasm, configuredHost(scriptedFiskaly(t)), signAskEvent)
+	var got struct {
+		Status  string `json:"status"`
+		Receipt *struct {
+			QRPayload string `json:"qr_payload"`
+		} `json:"receipt"`
+	}
+	if err := json.Unmarshal([]byte(strings.TrimSpace(out)), &got); err != nil {
+		t.Fatalf("stdout: %v (%q) logs=%v", err, out, h.logs)
+	}
+	var fixture struct {
+		QR string `json:"qr_code_data"`
+	}
+	if err := json.Unmarshal([]byte(finishedResponse), &fixture); err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != "approved" || got.Receipt == nil || got.Receipt.QRPayload != fixture.QR {
+		t.Fatalf("want approved with receipt.qr_payload = fiskaly's qr_code_data verbatim, got %q (logs: %v)", out, h.logs)
+	}
+}
+
+// No qr_code_data from fiskaly → no receipt object (never a placeholder);
+// the sale is still approved with its TSE evidence.
+func TestFiscalSignAsk_NoQRCodeDataMeansNoReceiptObject(t *testing.T) {
+	wasm := buildWasm(t)
+	respond := func(c httpCall) (int, string, bool) {
+		switch {
+		case strings.Contains(c.URL, "/auth"):
+			return 200, `{"access_token":"tok-abc"}`, true
+		case strings.Contains(c.URL, "tx_revision=1"):
+			return 200, `{"state":"ACTIVE"}`, true
+		case strings.Contains(c.URL, "tx_revision=2"):
+			return 200, finishedResponseNoQR, true
+		}
+		t.Errorf("unexpected request: %s %s", c.Method, c.URL)
+		return 500, "", true
+	}
+	out, h := run(t, wasm, configuredHost(respond), signAskEvent)
+	var got map[string]any
+	if err := json.Unmarshal([]byte(strings.TrimSpace(out)), &got); err != nil {
+		t.Fatalf("stdout: %v (%q) logs=%v", err, out, h.logs)
+	}
+	if got["status"] != "approved" || got["tse"] == nil {
+		t.Fatalf("want approved with tse evidence, got %q", out)
+	}
+	if _, present := got["receipt"]; present {
+		t.Fatalf("no qr_code_data must mean no receipt object, got %q", out)
+	}
 }

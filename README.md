@@ -355,6 +355,16 @@ every *successfully signed* sale was immediately re-signed against the same
 had its `tse_result:*` audit record overwritten from signed to failed, and
 added a permanent queue entry.
 
+**The receipt QR code is fiskaly's own (v0.8.0, ut-docs#2880).** The
+approved answer carries fiskaly's `qr_code_data` — the DSFinV-K "V0;…"
+receipt QR string from the FINISHED transaction — verbatim as the
+`receipt.qr_payload` of `fiscal.sign.ask` contract 1.10.0; core stores it
+per sale and renders the QR on the receipt and every reprint from it. When
+fiskaly returns no `qr_code_data` (or one over the contract's 1 KiB bound)
+the answer carries no `receipt` object and the receipt shows no QR — never a
+placeholder. Needs a core that implements contract 1.10.0; an older core
+ignores the object and keeps its own provisional QR.
+
 **Tips and whole-bill discounts sign, with a balanced receipt (v0.7.0,
 ut-docs#833).** fiskaly renders `standard_v1` into DSFinV-K's
 `Beleg^<gross per VAT rate>^<per payment type>`, and those halves must be

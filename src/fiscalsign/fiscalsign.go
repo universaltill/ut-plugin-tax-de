@@ -21,7 +21,7 @@
 //     part a second provider would replace.
 //
 // Contract: ut-docs/reference/contracts/fiscal-sign-ask.md, tracking through
-// v1.9.0 (ut-docs#833's per-payment tip_recipient is the latest addition).
+// v1.10.0 (ut-docs#2880's `receipt` object on approved is the latest addition).
 package fiscalsign
 
 import (
@@ -205,10 +205,36 @@ type TSEEvidence struct {
 	SignatureAlgorithm string `json:"signature_algorithm,omitempty"`
 }
 
+// ReceiptQRMaxBytes is contract 1.10.0's bound on receipt.qr_payload; core
+// drops an object over it, so this plugin never sends one.
+const ReceiptQRMaxBytes = 1024
+
+// ReceiptEvidence is the generic `receipt` object an `approved` response may
+// carry since contract 1.10.0 (ut-docs#2880): the QR payload core renders on
+// the receipt (and on every reprint) verbatim, plus optional extra lines.
+// Core no longer builds a QR itself — without this object the receipt shows
+// none.
+type ReceiptEvidence struct {
+	QRPayload string   `json:"qr_payload,omitempty"`
+	Lines     []string `json:"lines,omitempty"`
+}
+
 // Response is what this plugin writes to stdout.
 type Response struct {
-	Status string       `json:"status"`
-	TSE    *TSEEvidence `json:"tse,omitempty"`
+	Status  string           `json:"status"`
+	TSE     *TSEEvidence     `json:"tse,omitempty"`
+	Receipt *ReceiptEvidence `json:"receipt,omitempty"`
+}
+
+// WithReceiptQR attaches fiskaly's qr_code_data as receipt.qr_payload,
+// verbatim. It is a no-op — never a placeholder — for a non-approved
+// response, an empty payload, or one over ReceiptQRMaxBytes.
+func (r Response) WithReceiptQR(payload string) Response {
+	if r.Status != StatusApproved || strings.TrimSpace(payload) == "" || len(payload) > ReceiptQRMaxBytes {
+		return r
+	}
+	r.Receipt = &ReceiptEvidence{QRPayload: payload}
+	return r
 }
 
 // JSON renders the response for stdout. Marshalling cannot fail for this

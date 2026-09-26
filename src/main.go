@@ -609,6 +609,10 @@ func handleFiscalSignAsk(raw []byte) {
 	// only signature+log_time, claiming the other paths were unknown; an
 	// independent review found that was simply wrong, and that this repo's
 	// own committed fixture already contained all of them.
+	//
+	// ut-docs#2880 (contract 1.10.0): fiskaly's own qr_code_data rides
+	// along verbatim as receipt.qr_payload — core renders the receipt QR
+	// from it and no longer invents one. No qr_code_data → no receipt object.
 	ev := res.Evidence
 	fmt.Print(string(fiscalsign.Approved(fiscalsign.TSEEvidence{
 		TransactionNumber:  ev.TransactionNumber,
@@ -618,7 +622,7 @@ func handleFiscalSignAsk(raw []byte) {
 		LogTime:            ev.LogTime,
 		Signature:          ev.Signature,
 		SignatureAlgorithm: ev.SignatureAlgorithm,
-	}).JSON()))
+	}).WithReceiptQR(ev.QRCodeData).JSON()))
 	os.Exit(0)
 }
 
