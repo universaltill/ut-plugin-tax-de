@@ -878,3 +878,84 @@ func TestFiscalSignAsk_NoQRCodeDataMeansNoReceiptObject(t *testing.T) {
 		t.Fatalf("no qr_code_data must mean no receipt object, got %q", out)
 	}
 }
+
+// coreChargePolicyAskResponse mirrors universal-till's
+// internal/pages/charge_hook.go chargePolicyAskResponse field-for-field
+// (ut-docs#974). Decoded with DisallowUnknownFields below, so a misspelled
+// key in this plugin's answer — which core's lenient json.Unmarshal would
+// silently drop, falling back to its default without a trace — fails here
+// instead.
+type coreChargePolicyAskResponse struct {
+	ServiceChargePermitted     *bool           `json:"service_charge_permitted"`
+	ServiceChargeDefaultRateBP int             `json:"service_charge_default_rate_bp"`
+	ServiceChargeTaxBasisBP    int             `json:"service_charge_tax_basis_bp"`
+	TipDefaultRecipient        string          `json:"tip_default_recipient"`
+	FiscalBusinessCase         string          `json:"fiscal_business_case"`
+	Charges                    json.RawMessage `json:"charges"`
+}
+
+// TestChargePolicyAsk_AnswersGermanPolicy drives the REAL compiled plugin
+// with core's charge.policy.ask event (ADR-0061; its payload is
+// deliberately empty — a whole-store ask) and asserts the answer core will
+// parse: service charge permitted, no default rate (merchant opts in),
+// taxed at the underlying supply's own §12 UStG rates (basis 0 = apportion),
+// tips default to the employee, DSFinV-K business case TrinkgeldAN.
+func TestChargePolicyAsk_AnswersGermanPolicy(t *testing.T) {
+	wasm := buildWasm(t)
+	h := &stubHost{settings: map[string]string{}, storage: map[string][]byte{}}
+	out, _ := run(t, wasm, h, `{"type":"charge.policy.ask","payload":{}}`)
+
+	dec := json.NewDecoder(strings.NewReader(strings.TrimSpace(out)))
+	dec.DisallowUnknownFields()
+	var got coreChargePolicyAskResponse
+	if err := dec.Decode(&got); err != nil {
+		t.Fatalf("stdout is not core's chargePolicyAskResponse shape: %v\nstdout: %q\nlogs: %v", err, out, h.logs)
+	}
+	if got.ServiceChargePermitted == nil || !*got.ServiceChargePermitted {
+		t.Errorf("service_charge_permitted = %v, want explicit true (a service charge is lawful in DE)", got.ServiceChargePermitted)
+	}
+	if got.ServiceChargeDefaultRateBP != 0 {
+		t.Errorf("service_charge_default_rate_bp = %d, want 0 (off by default in DE)", got.ServiceChargeDefaultRateBP)
+	}
+	if got.ServiceChargeTaxBasisBP != 0 {
+		t.Errorf("service_charge_tax_basis_bp = %d, want 0 (apportion at the lines' own rates — a flat rate would mis-tax a mixed 7%%/19%% bill)", got.ServiceChargeTaxBasisBP)
+	}
+	if got.TipDefaultRecipient != "employee" {
+		t.Errorf("tip_default_recipient = %q, want employee", got.TipDefaultRecipient)
+	}
+	if got.FiscalBusinessCase != "TrinkgeldAN" {
+		t.Errorf("fiscal_business_case = %q, want TrinkgeldAN", got.FiscalBusinessCase)
+	}
+	if len(got.Charges) != 0 {
+		t.Errorf("charges = %s, want absent (core applies each item verbatim to every sale)", got.Charges)
+	}
+	if len(h.calls) != 0 {
+		t.Errorf("charge.policy.ask made %d HTTP calls; it is a pure, offline answer", len(h.calls))
+	}
+}
+
+// TestManifestSubscribesChargePolicyAsk: core only dispatches an event to a
+// plugin whose manifest.json hooks[] declares it, so a handler in main.go
+// without this entry is dead code that every other test here would still
+// pass — the same failure shape as this repo's sale_type field that "existed
+// … but nothing populated it" (CLAUDE.md).
+func TestManifestSubscribesChargePolicyAsk(t *testing.T) {
+	b, err := os.ReadFile("../../manifest.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var m struct {
+		Hooks []struct {
+			Event string `json:"event"`
+		} `json:"hooks"`
+	}
+	if err := json.Unmarshal(b, &m); err != nil {
+		t.Fatal(err)
+	}
+	for _, h := range m.Hooks {
+		if h.Event == "charge.policy.ask" {
+			return
+		}
+	}
+	t.Fatal("manifest.json hooks[] does not declare charge.policy.ask — core would never ask this plugin")
+}

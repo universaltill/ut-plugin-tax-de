@@ -99,6 +99,7 @@ import (
 	"unsafe"
 
 	"github.com/universaltill/ut-plugin-tax-de/src/auditkey"
+	"github.com/universaltill/ut-plugin-tax-de/src/chargepolicy"
 	"github.com/universaltill/ut-plugin-tax-de/src/datev"
 	"github.com/universaltill/ut-plugin-tax-de/src/fiscalsign"
 	"github.com/universaltill/ut-plugin-tax-de/src/fiskalyparse"
@@ -956,6 +957,13 @@ func main() {
 
 	case ev.Type == "tax.rate.ask":
 		handleTaxRateAsk(raw)
+
+	// ADR-0061 Decision 1 (ut-docs#974): Germany's service-charge/tip
+	// policy. A constant, offline answer — the payload is deliberately
+	// empty (a whole-store ask), so there is nothing to read from it.
+	case ev.Type == "charge.policy.ask":
+		fmt.Print(string(mustJSON(chargepolicy.DE())))
+		os.Exit(0)
 
 	// The generic export/report dispatch hook (ut-docs#189) — the host
 	// (internal/pages/data_api.go) resolves entries[].key to this plugin's

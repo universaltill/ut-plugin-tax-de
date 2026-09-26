@@ -230,7 +230,9 @@ Known gaps #5/#6/#7.
   `type` field (**`fiscal.sign.ask` → `handleFiscalSignAsk`, the real TSE
   signing point**; `tax.rate.ask` →
   `handleTaxRateAsk`, the dine-in/takeaway VAT switch, verified against a
-  real wazero run — see README's status table; `export.requested.ask` →
+  real wazero run — see README's status table; `charge.policy.ask` →
+  `chargepolicy.DE()`, Germany's service-charge/tip policy, ut-docs#974;
+  `export.requested.ask` →
   `handleDSFinVKExport` or `handleDATEVExport` depending on `entry_key`).
 - `src/fiscalsign/` — the pure, host-independent half of the
   `fiscal.sign.ask` answerer: contract wire types, and the VAT/payment
@@ -259,6 +261,12 @@ Known gaps #5/#6/#7.
   the overrides JSON was last (re)serialized — same failure shape as the
   tax-code equal-pair bug fixed in ut-docs#536, generalized to this
   setting.
+- `src/chargepolicy/` — the pure, host-independent `charge.policy.ask`
+  answer (ADR-0061, ut-docs#974): a constant that deliberately matches
+  core's no-plugin default. `Answer` has no `omitempty` (an absent
+  `service_charge_permitted` reads as permitted on core's side) and no
+  `Charges` field — core applies ADR-0062 levies verbatim with no merchant
+  override, and Germany has none. Don't add one without research behind it.
 - `src/auditkey/` — the pure, host-independent `tse_result:*` storage-key
   derivation (ut-docs#1299). Same reason as `src/fiscalsign/`/`src/taxrate/`
   — no wasip1 tag, so `go test ./src/auditkey/...` runs on the host.
@@ -336,7 +344,7 @@ Known gaps #5/#6/#7.
   `docs/`/`.github/`/`scripts/` other than `build.sh` is exempt. Never
   publish by hand — tag `v<version>`.
 - `go test ./...` — now covers `src/datev`, `src/fiskalyparse`,
-  `src/fiscalsign`, `src/taxrate` and `src/wasmrun` (the last actually
+  `src/fiscalsign`, `src/taxrate`, `src/chargepolicy` and `src/wasmrun` (the last actually
   compiles and runs the plugin as wasm, so it is slower than the rest;
   `src/main.go` remains untestable directly, wasip1-only).
 - `bash scripts/build.sh` (the real build check — cross-compiles
