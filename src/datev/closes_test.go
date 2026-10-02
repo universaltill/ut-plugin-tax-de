@@ -56,6 +56,7 @@ func referenceDayClose() EODCloseExport {
 				{Method: "cash", RateBP: 1900, Net: 7084, Tax: 1346, Gross: 8430},
 			},
 			Gross:              122540,
+			Net:                122540, // no refunds on the reference day
 			VouchersIssued:     1500,
 			Tips:               []EODTip{{Method: "card", Count: 1, Amount: 320}},
 			CashReconciliation: &CashReconciliation{Skim: -41110},
@@ -459,6 +460,7 @@ func TestBuildFromCloses_NormalCashCardVoucherDay(t *testing.T) {
 				{Method: "giro", RateBP: 700, Net: 300, Tax: 21, Gross: 321},
 			},
 			Gross:              2178, // 678 cells + 1500 vouchers
+			Net:                2178, // no refunds
 			VouchersIssued:     1500,
 			CashReconciliation: &CashReconciliation{Skim: -100},
 		},
@@ -628,5 +630,88 @@ func TestRateText(t *testing.T) {
 		if got := rateText(bp); got != want {
 			t.Errorf("rateText(%d) = %q, want %q", bp, got, want)
 		}
+	}
+}
+
+// TestBuildFromCloses_RevenueWithoutCrossTab_RefusesByName (ut-docs#3421):
+// a close whose Z-report says it took revenue (Net minus VouchersIssued,
+// the part the cross-tab must carry) but whose cross-tab has no non-zero
+// cell — an archive row from before the cross-tab existed, say — would
+// otherwise contribute zero rows. Next to a normal close that is a batch
+// that "succeeds" while one day's takings are silently missing; it must
+// refuse and name the close instead.
+func TestBuildFromCloses_RevenueWithoutCrossTab_RefusesByName(t *testing.T) {
+	noCrossTab := EODCloseExport{
+		ZNumber: 70,
+		Report:  EODReportForExport{Day: "2026-08-22", Gross: 5000, Net: 5000},
+	}
+	allZeroCells := EODCloseExport{
+		ZNumber: 71,
+		Report: EODReportForExport{
+			Day:            "2026-08-23",
+			Gross:          4200,
+			Net:            4200,
+			MethodTaxBands: []MethodTaxBand{{Method: "cash", RateBP: 1900, Gross: 0}},
+		},
+	}
+	for _, tc := range []struct {
+		name  string
+		close EODCloseExport
+		want  string
+	}{
+		{"empty cross-tab", noCrossTab, "Z70 (2026-08-22)"},
+		{"only zero cells", allZeroCells, "Z71 (2026-08-23)"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := BuildFromCloses([]EODCloseExport{referenceDayClose(), tc.close}, closesSettings(), time.Now())
+			if err == nil {
+				t.Fatal("expected a refusal: the batch would silently leave this close's revenue out")
+			}
+			if !strings.Contains(err.Error(), tc.want) || !strings.Contains(err.Error(), "cross-tab cell") {
+				t.Fatalf("error should name %s and the missing cross-tab, got: %v", tc.want, err)
+			}
+		})
+	}
+
+	// Refunds net the day negative: still revenue the batch can't book.
+	negative := EODCloseExport{ZNumber: 72, Report: EODReportForExport{Day: "2026-08-24", Gross: 200, Net: -300}}
+	if _, err := BuildFromCloses([]EODCloseExport{referenceDayClose(), negative}, closesSettings(), time.Now()); err == nil || !strings.Contains(err.Error(), "Z72") {
+		t.Fatalf("a negative-gross close without a cross-tab must refuse by name, got: %v", err)
+	}
+}
+
+// TestBuildFromCloses_NoCrossTabWithoutRevenue_StillBuilds is the other
+// half of ut-docs#3421: a close with no cross-tab is fine when there is no
+// revenue for it to carry — a genuinely zero-sales day, a day whose only
+// takings were voucher sales (Net == VouchersIssued; vouchers are a
+// liability outside every per-rate band), or a day whose only trade was a
+// sale and its full return (Gross > 0, but Net == 0 and the cross-tab nets
+// every cell to zero).
+func TestBuildFromCloses_NoCrossTabWithoutRevenue_StillBuilds(t *testing.T) {
+	zeroSales := EODCloseExport{ZNumber: 80, Report: EODReportForExport{Day: "2026-08-22"}}
+	voucherOnly := EODCloseExport{
+		ZNumber: 81,
+		Report:  EODReportForExport{Day: "2026-08-23", Gross: 2500, Net: 2500, VouchersIssued: 2500},
+	}
+	saleAndReturn := EODCloseExport{
+		ZNumber: 82,
+		Report: EODReportForExport{
+			Day:            "2026-08-24",
+			Gross:          1190,
+			Net:            0,
+			MethodTaxBands: []MethodTaxBand{{Method: "cash", RateBP: 1900, Gross: 0}},
+		},
+	}
+	res, err := BuildFromCloses([]EODCloseExport{referenceDayClose(), zeroSales, voucherOnly, saleAndReturn}, closesSettings(), time.Now().UTC())
+	if err != nil {
+		t.Fatalf("closes without revenue to book must not be refused, got: %v", err)
+	}
+	got := bookingTuples(t, res)
+	if len(got) != 8 {
+		t.Fatalf("expected the reference day's 7 rows plus the voucher-only day's 1, got %d: %v", len(got), got)
+	}
+	last := got[len(got)-1]
+	if last[0] != "25,00" || last[5] != `"81"` {
+		t.Fatalf("expected the voucher-only close's 25,00 voucher row keyed to Z81, got: %v", last)
 	}
 }

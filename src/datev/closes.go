@@ -51,6 +51,11 @@ type EODReportForExport struct {
 	// figure: sum(Erloes rows) + VouchersIssued == Gross (pinned by
 	// TestBuildFromCloses_ReconcilesToZReportGross).
 	Gross int64 `json:"gross"`
+	// Net is the Z-report's Gross minus its refund total (minor units). The
+	// cross-tab nets returns (sign-flipped) into its cells, so the host's
+	// own identity is sum(cross-tab gross) == Net - VouchersIssued — the
+	// revenue a close's cross-tab must carry (ut-docs#3421).
+	Net int64 `json:"net"`
 	// VouchersIssued is the day's voucher-issuance total (minor units) —
 	// a liability (§3 Abs. 13 UStG), not revenue. It carries NO
 	// payment-method breakdown (a day total), which is why the Konto the
@@ -159,7 +164,11 @@ func BuildFromCloses(closes []EODCloseExport, settings Settings, now time.Time) 
 		if _, derr := time.Parse("2006-01-02", c.Report.Day); derr != nil {
 			addProblem("%s: unparseable day %q", closeName, c.Report.Day)
 		}
+		crossTabCarriesRevenue := false
 		for _, cell := range c.Report.MethodTaxBands {
+			if cell.Gross != 0 {
+				crossTabCarriesRevenue = true
+			}
 			if _, ok := kontoFor(cell.Method); !ok {
 				missingMethods[cell.Method] = true
 			}
@@ -174,6 +183,20 @@ func BuildFromCloses(closes []EODCloseExport, settings Settings, now time.Time) 
 				// than book an inflated "S" row from its absolute value.
 				addProblem("%s: cross-tab cell %s/%sbp has a negative gross (%d) — no verified representation for a negative day cell; refusing rather than misbooking it", closeName, cell.Method, strconv.Itoa(cell.RateBP), cell.Gross)
 			}
+		}
+		// The revenue rows come only from the cross-tab, which carries
+		// Net minus VouchersIssued (see Net's doc comment). A close with
+		// revenue but no non-zero cell — e.g. archived before the cross-tab
+		// existed — would add no rows and drop out of the batch unnoticed
+		// (ut-docs#3421). Refuse it by name. Net, not Gross: a day whose
+		// only trade was a sale and its full return nets every cell to 0
+		// and has no revenue to book. Residual gap, accepted: a cross-tab
+		// that is present but PARTIAL (sum != Net - VouchersIssued) still
+		// exports; asserting the full identity would falsely refuse legacy
+		// archives (e.g. pre-#1008 closes whose Net holds voucher face value
+		// with no vouchers_issued field).
+		if revenue := c.Report.Net - c.Report.VouchersIssued; revenue != 0 && !crossTabCarriesRevenue {
+			addProblem("%s: the Z-report shows a non-zero net (%d, vouchers issued %d) but the close has no non-zero payment-method x VAT-rate cross-tab cell to book it from — it was probably archived before the cross-tab existed; refusing rather than leaving its revenue out of the batch", closeName, c.Report.Net, c.Report.VouchersIssued)
 		}
 		for _, tip := range c.Report.Tips {
 			if tip.Amount == 0 {

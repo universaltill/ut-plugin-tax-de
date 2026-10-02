@@ -69,7 +69,12 @@ needed, ADR-0002's `tax`/`export` types already exist):
   from live sales. Routing is on the field's *presence*: a host that
   supports `eod_closes` always sends it (`[]` when the range has no
   archived close, in which case the export refuses with a clear
-  "close the day first" error rather than silently switching grain). Only
+  "close the day first" error rather than silently switching grain). A
+  close whose Z-report shows a non-zero net but whose cross-tab has no
+  non-zero cell (e.g. archived before the cross-tab existed) refuses the
+  export and is named (`Z<n> (<day>)`), rather than silently dropping out
+  of the batch (ut-docs#3421, v0.10.1). A cross-tab that is present but
+  only partial is not detected — see Known gap #9. Only
   when the field is entirely absent (a pre-#1005 host that doesn't know
   the concept) does the pre-v0.5.0 per-sale grain (`datev.Build`, one row
   per sale × tax line against `datev_konto_kasse`, ut-docs#221) still
@@ -275,6 +280,15 @@ and its independent review, for the full finding):**
    than folded into this one (same reasoning as this card's own non-goal
    on raising `StorageMaxKeys`: bigger blast radius, needs its own design
    pass).
+
+9. **A partial day-close cross-tab is not detected (ut-docs#3421).**
+   `BuildFromCloses` refuses a close whose Z-report net (minus vouchers
+   issued) is non-zero but whose cross-tab has no non-zero cell. It does
+   NOT check that the cells add up to that figure, so a cross-tab that is
+   present but incomplete would still export with revenue missing. The
+   full identity is not asserted because legacy archives would be falsely
+   refused (e.g. a pre-#1008 close whose net holds voucher face value but
+   which has no `vouchers_issued` field).
 
 ## What's real vs. placeholder
 
