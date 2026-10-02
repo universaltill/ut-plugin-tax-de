@@ -210,26 +210,36 @@ func TestBuildReceipt_BusinessTipStandardRate(t *testing.T) {
 	}
 }
 
-func TestBuildReceipt_BusinessTipRefuseSetting(t *testing.T) {
-	_, err := BuildReceipt(Request{
-		Total:        1190,
+// ADR-0136 Decision 7 (ut-docs#3309): "refuse" is no longer a treatment. A
+// shop that still has the legacy value stored reads it as proportional —
+// no migration — and the sale signs with exactly the default's math
+// (€10 @19% + €10 @7%, €2 business tip → 11.00 / 11.00), never refused.
+func TestBuildReceipt_LegacyRefuseSettingSignsProportionally(t *testing.T) {
+	r := mustBuild(t, Request{
+		Total:        2000,
 		TaxInclusive: boolPtr(true),
-		Payments:     []Payment{{Method: "card", Amount: 1290, TipAmount: 100, TipRecipient: "business"}},
-		VATBreakdown: []VATLine{{RateBP: 1900, Net: 1190, Tax: 190}},
-	}, Options{BusinessTip: BusinessTipRefuse})
-	if !errors.Is(err, ErrCannotSign) {
-		t.Fatalf("err = %v, want ErrCannotSign", err)
+		Payments:     []Payment{{Method: "card", Amount: 2200, TipAmount: 200, TipRecipient: "business"}},
+		VATBreakdown: []VATLine{{RateBP: 700, Net: 1000, Tax: 65}, {RateBP: 1900, Net: 1000, Tax: 160}},
+	}, Options{BusinessTip: ParseBusinessTipTreatment("refuse")})
+	v := vatMap(r)
+	if v["NORMAL"] != "11.00" || v["REDUCED_1"] != "11.00" {
+		t.Fatalf("VAT = %v, want NORMAL 11.00 / REDUCED_1 11.00 (proportional)", v)
+	}
+	if _, ok := v["NULL"]; ok {
+		t.Fatalf("a business tip is turnover, never in NULL: %v", v)
 	}
 }
 
-// An unknown setting value must never be guessed at: refuse.
+// Only an exact "standard_rate" selects the 19% treatment; everything else
+// — empty, "proportional", the legacy "refuse", or anything unrecognised —
+// is proportional (ADR-0136 Decision 7). Nothing can select refusal.
 func TestParseBusinessTipTreatment(t *testing.T) {
 	cases := map[string]BusinessTipTreatment{
 		"":                BusinessTipProportional,
 		"proportional":    BusinessTipProportional,
 		" Standard_Rate ": BusinessTipStandardRate,
-		"refuse":          BusinessTipRefuse,
-		"19%":             BusinessTipRefuse,
+		"refuse":          BusinessTipProportional,
+		"19%":             BusinessTipProportional,
 	}
 	for in, want := range cases {
 		if got := ParseBusinessTipTreatment(in); got != want {

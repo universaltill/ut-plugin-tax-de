@@ -207,8 +207,10 @@ func setting(key string) string {
 }
 
 // businessTipTreatment reads tip_business_vat_treatment. Not set (-1)
-// means the default; any other host error reads as refuse, so a merchant's
-// configured "refuse" is never silently replaced by the signing default.
+// means the default; any other host error also falls back to the default,
+// proportional — there is no refusing treatment to fall back to any more
+// (ut-docs ADR-0136 Decision 7, ut-docs#3309), and proportional is what
+// every value except an exact "standard_rate" reads as anyway.
 func businessTipTreatment() fiscalsign.BusinessTipTreatment {
 	kb := []byte("tip_business_vat_treatment")
 	out, code := callBuf(func(dp, dc uint32) int32 {
@@ -219,8 +221,8 @@ func businessTipTreatment() fiscalsign.BusinessTipTreatment {
 	case code == -1:
 		return fiscalsign.ParseBusinessTipTreatment("")
 	case code < 0:
-		logf("tax-de: reading tip_business_vat_treatment failed (host code %d) -- refusing business tips", code)
-		return fiscalsign.BusinessTipRefuse
+		logf("tax-de: reading tip_business_vat_treatment failed (host code %d) -- using the proportional default", code)
+		return fiscalsign.ParseBusinessTipTreatment("")
 	}
 	return fiscalsign.ParseBusinessTipTreatment(string(out))
 }
@@ -565,9 +567,11 @@ func handleFiscalSignAsk(raw []byte) {
 	//
 	// A TSE signature cannot be corrected afterwards, so a receipt known
 	// to misstate the sale is never signed: answer cannot-sign (contract
-	// 1.3.0), and core completes the sale unsigned, journals it, prints
-	// the notice and alerts the operator. Same principle as never
-	// fabricating a signature.
+	// 1.3.0). Since ut-docs ADR-0136 core refuses that tender at the till
+	// (reversing any captured card payment) so the cashier can fix the
+	// tip, discount or rate or void the sale; a refund/return is still
+	// completed and declared unsigned. Same principle as never fabricating
+	// a signature.
 	receipt, err := fiscalsign.BuildReceipt(req, fiscalsign.Options{
 		BusinessTip: businessTipTreatment(),
 	})
