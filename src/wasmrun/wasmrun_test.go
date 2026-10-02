@@ -555,9 +555,12 @@ func TestFiscalSignAsk_EmployeeTipSignsInNullBucket(t *testing.T) {
 	}
 }
 
-// A tip the business keeps, with the merchant's setting at refuse: the
-// plugin must not sign, and must not contact fiskaly.
-func TestFiscalSignAsk_BusinessTipRefuseSettingIsHonoured(t *testing.T) {
+// ADR-0136 Decision 7 (ut-docs#3309): a tip the business keeps, with the
+// merchant's stored setting still at the legacy "refuse" value — no longer
+// a treatment, read as proportional with no migration. The plugin signs
+// (never answers cannot-sign): on a single 19% sale the whole business tip
+// lands on NORMAL (12.90 + 1.10), never in NULL.
+func TestFiscalSignAsk_LegacyBusinessTipRefuseSettingSignsProportionally(t *testing.T) {
 	wasm := buildWasm(t)
 	host := configuredHost(scriptedFiskaly(t))
 	host.settings["tip_business_vat_treatment"] = "refuse"
@@ -573,11 +576,20 @@ func TestFiscalSignAsk_BusinessTipRefuseSettingIsHonoured(t *testing.T) {
 	  }
 	}`
 	out, h := run(t, wasm, host, tipped)
-	if s := statusOf(t, out, h); s != "cannot-sign" {
-		t.Errorf("status = %q, want cannot-sign", s)
+	if s := statusOf(t, out, h); s != "approved" {
+		t.Fatalf("status = %q, want approved — a legacy refuse setting must sign proportionally (logs: %v)", s, h.logs)
 	}
-	if len(h.calls) != 0 {
-		t.Errorf("contacted fiskaly %d times", len(h.calls))
+	body := strings.ReplaceAll(h.calls[2].Body(), " ", "")
+	for _, want := range []string{
+		`{"vat_rate":"NORMAL","amount":"14.00"}`,
+		`{"payment_type":"NON_CASH","amount":"14.00"}`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("finish body missing %s\nbody: %s", want, body)
+		}
+	}
+	if strings.Contains(body, `"vat_rate":"NULL"`) {
+		t.Errorf("a business tip is turnover, never in NULL\nbody: %s", body)
 	}
 }
 

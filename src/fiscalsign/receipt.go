@@ -8,11 +8,12 @@ import (
 )
 
 // ErrCannotSign means the sale cannot be put on a Beleg whose two halves
-// agree, or the configured treatment says not to sign it. The caller
-// answers `cannot-sign` (contract 1.3.0): core completes the sale,
-// journals it unsigned and alerts the operator. A TSE signature cannot be
-// corrected afterwards, so a declared gap beats an irreversible false
-// record.
+// agree. The caller answers `cannot-sign` (contract 1.3.0): since
+// ut-docs ADR-0136 core refuses the tender (reversing any captured card
+// payment) so the cashier can fix the tip, discount or rate or void the
+// sale; a refund/return is still completed and declared unsigned. A TSE
+// signature cannot be corrected afterwards, so refusing beats an
+// irreversible false record.
 var ErrCannotSign = errors.New("cannot sign")
 
 // Tip recipients, as core sends them (ADR-0061 Decision 3, contract 1.9.0).
@@ -36,22 +37,22 @@ const (
 	BusinessTipProportional BusinessTipTreatment = "proportional"
 	// BusinessTipStandardRate puts the whole tip at 19% (NORMAL).
 	BusinessTipStandardRate BusinessTipTreatment = "standard_rate"
-	// BusinessTipRefuse does not sign a sale carrying a business tip.
-	BusinessTipRefuse BusinessTipTreatment = "refuse"
 )
 
 // ParseBusinessTipTreatment reads the `tip_business_vat_treatment`
-// setting. Empty means the default; any value it does not recognise is
-// read as refuse — a compliance setting is never guessed at.
+// setting. Only an exact "standard_rate" (case/space-insensitive) selects
+// the 19% treatment; everything else — empty, "proportional", or any value
+// it does not recognise — is proportional. That includes the legacy
+// "refuse" value: ut-docs ADR-0136 Decision 7 (ut-docs#3309) withdrew
+// refusal as a treatment, since core now refuses a cannot-sign tender at
+// the till; the setting is read at request time, never materialized, so a
+// shop with "refuse" stored needs no migration — it signs proportionally
+// from the next sale on.
 func ParseBusinessTipTreatment(s string) BusinessTipTreatment {
-	switch v := BusinessTipTreatment(strings.ToLower(strings.TrimSpace(s))); v {
-	case "":
-		return BusinessTipProportional
-	case BusinessTipProportional, BusinessTipStandardRate, BusinessTipRefuse:
-		return v
-	default:
-		return BusinessTipRefuse
+	if BusinessTipTreatment(strings.ToLower(strings.TrimSpace(s))) == BusinessTipStandardRate {
+		return BusinessTipStandardRate
 	}
+	return BusinessTipProportional
 }
 
 // Options carries the merchant settings that shape the signed receipt.
@@ -87,8 +88,9 @@ const standardRateBP = 1900
 //   - an employee's tip (TrinkgeldAN, USt-Schlüssel 5) is not the
 //     business's turnover: it goes in the 0%/NULL bucket;
 //   - a tip the business keeps (TrinkgeldAG) is turnover, placed per
-//     Options.BusinessTip — proportionally across the sale's taxable
-//     rates only, never into NULL;
+//     Options.BusinessTip — at 19% for BusinessTipStandardRate, otherwise
+//     proportionally across the sale's taxable rates only, never into
+//     NULL;
 //   - a rate with no DSFinV-K bucket (anything but 19/7/10.7/5.5/0%) is
 //     refused, never signed under another rate;
 //   - the payment side counts each tip exactly once, whether or not core
@@ -144,10 +146,15 @@ func BuildReceipt(req Request, opt Options) (Receipt, error) {
 	gross[0] += employeeTips
 	if businessTips > 0 {
 		switch opt.BusinessTip {
-		case "", BusinessTipProportional:
+		case BusinessTipStandardRate:
+			gross[standardRateBP] += businessTips
+		default:
+			// BusinessTipProportional, the zero value, and anything else
+			// (ADR-0136 Decision 7: there is no refusing treatment).
 			// Weighted by the TAXABLE rates only: a business tip is
 			// turnover, so no share of it may land in the 0%/NULL bucket
-			// (a fully zero-rated sale leaves nothing to weight by → refuse).
+			// (a fully zero-rated sale leaves nothing to weight by →
+			// cannot-sign).
 			delete(saleGross, 0)
 			shares, err := apportion(businessTips, saleGross)
 			if err != nil {
@@ -156,10 +163,6 @@ func BuildReceipt(req Request, opt Options) (Receipt, error) {
 			for rate, s := range shares {
 				gross[rate] += s
 			}
-		case BusinessTipStandardRate:
-			gross[standardRateBP] += businessTips
-		default:
-			return Receipt{}, fmt.Errorf("%w: business tip and tip_business_vat_treatment=%q", ErrCannotSign, opt.BusinessTip)
 		}
 	}
 
