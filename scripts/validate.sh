@@ -24,6 +24,19 @@ if m.get("countries") != ["DE"]: errs.append("countries must be ['DE'] (ADR-0025
 types = [e.get("type") for e in m.get("entries", [])]
 if "tax" not in types: errs.append("expected an entries[] item with type=tax (TSE signing)")
 if "export" not in types: errs.append("expected an entries[] item with type=export (DSFinV-K export)")
+# A map/list setting whose default_value is a JSON *string* ("{}") rather
+# than a real JSON object/list ({}) gets double-encoded by core's
+# json.Marshal(s.DefaultValue) at install time (ut-docs#1255/#1270).
+# Plain-string defaults ("", "zip", "4", "0101") don't parse to a dict/list.
+for s in m.get("settings", []):
+    key, dv = s.get("key"), s.get("default_value")
+    if isinstance(dv, str):
+        try:
+            parsed = json.loads(dv)
+        except ValueError:
+            continue
+        if isinstance(parsed, (dict, list)):
+            errs.append(f"setting {key}'s default_value is a JSON-string-wrapped object/list ('{dv}') instead of a real JSON object/list — double-encodes at plugin-install time (ut-docs#1255/#1270)")
 if errs:
     print("FAIL: " + "; ".join(errs)); sys.exit(1)
 print(f"ok {m['id']} v{m['version']}")
