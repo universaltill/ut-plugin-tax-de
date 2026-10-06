@@ -350,7 +350,9 @@ Known gaps #5/#6/#7.
 - `bash scripts/build.sh` (the real build check — cross-compiles
   `GOOS=wasip1 GOARCH=wasm`).
 - `bash scripts/validate.sh` (manifest shape: `canonical_type: tax`,
-  `countries: ["DE"]`, one `tax`-type and one `export`-type entry).
+  `countries: ["DE"]`, one `tax`-type and one `export`-type entry, and that
+  no map/list-typed setting's `default_value` is a JSON-string-wrapped
+  object/list instead of a real one — ut-docs#1255/#1270).
 - Keep README.md's status table and this file's caveats current — this repo
   exists specifically to be honest about what's real vs. placeholder; don't
   let code changes silently upgrade a claim without re-verifying it.
