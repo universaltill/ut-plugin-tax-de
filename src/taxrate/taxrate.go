@@ -22,7 +22,10 @@ const OrderTypeTakeaway = "takeaway"
 // sale's current order type.
 //
 // orderType is the sale's order type as sent in the ask payload ("" for
-// dine-in/standard, or OrderTypeTakeaway). taxCodeID identifies the
+// dine-in/standard, OrderTypeTakeaway, or "none" when the shop has the
+// dine-in/takeaway choice switched off, ut-docs#3632 -- no consumption-mode
+// distinction, so the item's own rate applies; any value other than
+// OrderTypeTakeaway is no-opinion). taxCodeID identifies the
 // line's tax code. overridesJSON is called to fetch the merchant-
 // configured takeaway_rate_overrides plugin setting verbatim -- a JSON
 // object mapping tax_code_id -> takeaway basis points, possibly ""
@@ -40,9 +43,10 @@ const OrderTypeTakeaway = "takeaway"
 // back to the line's own configured rate unchanged (exactly the pre-tax-
 // plugin default). That is the correct answer for:
 //
-//   - dine-in (orderType != OrderTypeTakeaway): §12 UStG's switch only
-//     ever pulls a rate DOWN for takeaway, it never touches dine-in --
-//     and overridesJSON is never even called for this case.
+//   - dine-in, "none" or any unknown value (orderType !=
+//     OrderTypeTakeaway): §12 UStG's switch only ever pulls a rate DOWN
+//     for takeaway, it never touches dine-in -- and overridesJSON is
+//     never even called for this case.
 //   - a tax code with no configured override -- e.g. food, which German
 //     law already taxes at 7% in both modes since 2026-01-01, so there is
 //     nothing to switch. "No entry" and "an entry present but <= 0" mean
