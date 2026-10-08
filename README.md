@@ -97,8 +97,10 @@ needed, ADR-0002's `tax`/`export` types already exist):
   asks this plugin "what's the rate for this line, given this order type";
   `handleTaxRateAsk` in `src/main.go` answers from the merchant-configured
   `takeaway_rate_overrides` setting (tax_code_id → basis points) when the
-  order type is takeaway, or declines (writes nothing) for dine-in or an
-  unconfigured tax code — core then falls back to the line's own rate.
+  order type is takeaway, or declines (writes nothing) for dine-in, `"none"`
+  (the shop has the dine-in/takeaway choice switched off — the item's own
+  rate applies), any other order type, or an unconfigured tax code — core
+  then falls back to the line's own rate.
 
 - **Service-charge / tip policy (ADR-0061, ut-docs#974, v0.9.0).**
   Answers core's `charge.policy.ask` (a blocking, whole-store ask) with

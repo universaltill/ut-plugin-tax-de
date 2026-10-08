@@ -136,6 +136,25 @@ func TestResolve_DineInNeverConsultsOverrides(t *testing.T) {
 	}
 }
 
+// TestResolve_NoneNeverConsultsOverrides: order_type "none" (the shop has the
+// dine-in/takeaway choice switched off, sale.order_type_prompt = off,
+// ut-docs#3632) means no consumption-mode distinction, so the item's own rate
+// applies: no opinion, and the overrides are never even fetched. An unknown
+// future value gets the same fail-safe treatment -- only an explicit
+// "takeaway" may pull a rate down.
+func TestResolve_NoneNeverConsultsOverrides(t *testing.T) {
+	tripwire := func() string {
+		t.Fatal("overridesJSON() was called for a non-takeaway order type -- Resolve must check orderType first")
+		return ""
+	}
+	for _, ot := range []string{"none", "delivery", "Takeaway"} {
+		bp, ok, err := Resolve(ot, "tax-coffee", tripwire)
+		if err != nil || ok || bp != 0 {
+			t.Fatalf("Resolve(%q, ...) = (%d, %v, %v), want (0, false, nil)", ot, bp, ok, err)
+		}
+	}
+}
+
 func TestResolve_OverridePresentButZeroOrNegativeTreatedAsUnset(t *testing.T) {
 	for _, overrides := range []string{`{"tax-food":0}`, `{"tax-food":-100}`} {
 		bp, ok, err := Resolve(OrderTypeTakeaway, "tax-food", constFn(overrides))
