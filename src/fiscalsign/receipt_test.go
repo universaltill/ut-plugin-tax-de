@@ -2,6 +2,7 @@ package fiscalsign
 
 import (
 	"errors"
+	"strings"
 	"testing"
 )
 
@@ -141,27 +142,68 @@ func TestBuildReceipt_InfersPricingModeWithDiscount(t *testing.T) {
 // turnover, so it sits in the 0%/NULL bucket and the Beleg balances. This
 // is the body's own example: €12.90 bill, €14.00 on the card.
 func TestBuildReceipt_EmployeeTipInNullBucket(t *testing.T) {
+	r := mustBuild(t, Request{
+		Total:        1290,
+		TaxInclusive: boolPtr(true),
+		Payments:     []Payment{{Method: "card", Amount: 1400, TipAmount: 110, TipRecipient: "employee"}},
+		VATBreakdown: []VATLine{{RateBP: 1900, Net: 1290, Tax: 206}},
+	}, Options{})
+	if v := vatMap(r); v["NORMAL"] != "12.90" || v["NULL"] != "1.10" {
+		t.Fatalf("VAT = %v, want NORMAL 12.90 / NULL 1.10", v)
+	}
+	if p := payMap(r); p["NON_CASH"] != "14.00" {
+		t.Fatalf("payments = %v, want NON_CASH 14.00 (tip counted once)", p)
+	}
+}
+
+// Contract 1.11.0 (ut-docs#2571, #2976): every payment's amount includes its
+// own tip, so a sale paid exactly has Σamount == total + Σtip. A tipped
+// payment whose amount equals the total (the pre-1.11.0 reader-reported
+// shape, tip left outside amount) no longer matches the contract: it is
+// refused, never signed by guessing the tip sits on top.
+func TestBuildReceipt_TipOutsideAmountRefused(t *testing.T) {
 	for _, tc := range []struct {
-		name   string
-		amount int64
+		name     string
+		payments []Payment
 	}{
-		{"amount includes the tip (core's stored convention)", 1400},
-		{"amount excludes the tip (reader-reported path)", 1290},
+		{"single tipped leg", []Payment{{Method: "card", Amount: 1290, TipAmount: 110, TipRecipient: "employee"}}},
+		{"business tip", []Payment{{Method: "card", Amount: 1290, TipAmount: 110, TipRecipient: "business"}}},
+		{"split tender, tip on card", []Payment{{Method: "cash", Amount: 290}, {Method: "card", Amount: 1000, TipAmount: 110}}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			r := mustBuild(t, Request{
+			_, err := BuildReceipt(Request{
 				Total:        1290,
 				TaxInclusive: boolPtr(true),
-				Payments:     []Payment{{Method: "card", Amount: tc.amount, TipAmount: 110, TipRecipient: "employee"}},
+				Payments:     tc.payments,
 				VATBreakdown: []VATLine{{RateBP: 1900, Net: 1290, Tax: 206}},
 			}, Options{})
-			if v := vatMap(r); v["NORMAL"] != "12.90" || v["NULL"] != "1.10" {
-				t.Fatalf("VAT = %v, want NORMAL 12.90 / NULL 1.10", v)
+			if !errors.Is(err, ErrCannotSign) {
+				t.Fatalf("err = %v, want ErrCannotSign (Σamount must be total + Σtip)", err)
 			}
-			if p := payMap(r); p["NON_CASH"] != "14.00" {
-				t.Fatalf("payments = %v, want NON_CASH 14.00 (tip counted once)", p)
+			// Refused by the explicit 1.11.0 check, not only by the later
+			// halves-balance check, so the log names the real cause.
+			if !strings.Contains(err.Error(), "contract 1.11.0") {
+				t.Fatalf("err = %v, want the contract 1.11.0 tip-convention refusal", err)
 			}
 		})
+	}
+}
+
+// An over-tender by exactly the tip total used to be indistinguishable from
+// "tip inside amount" while both conventions were accepted. With only the
+// 1.11.0 convention left, the payment side must equal total + Σtip to the
+// cent: one cent either way is refused.
+func TestBuildReceipt_PaymentsOffByOneCentRefused(t *testing.T) {
+	for _, amount := range []int64{1399, 1401} {
+		_, err := BuildReceipt(Request{
+			Total:        1290,
+			TaxInclusive: boolPtr(true),
+			Payments:     []Payment{{Method: "card", Amount: amount, TipAmount: 110}},
+			VATBreakdown: []VATLine{{RateBP: 1900, Net: 1290, Tax: 206}},
+		}, Options{})
+		if !errors.Is(err, ErrCannotSign) {
+			t.Errorf("amount %d: err = %v, want ErrCannotSign", amount, err)
+		}
 	}
 }
 
@@ -171,7 +213,7 @@ func TestBuildReceipt_MissingRecipientIsEmployee(t *testing.T) {
 	r := mustBuild(t, Request{
 		Total:        1190,
 		TaxInclusive: boolPtr(true),
-		Payments:     []Payment{{Method: "card", Amount: 1190, TipAmount: 100}},
+		Payments:     []Payment{{Method: "card", Amount: 1290, TipAmount: 100}},
 		VATBreakdown: []VATLine{{RateBP: 1900, Net: 1190, Tax: 190}},
 	}, Options{})
 	if v := vatMap(r); v["NULL"] != "1.00" || v["NORMAL"] != "11.90" {
@@ -248,8 +290,8 @@ func TestParseBusinessTipTreatment(t *testing.T) {
 	}
 }
 
-// Payments that reconcile with the total neither with nor without the tips
-// (e.g. an under-reported payment) are refused, never signed.
+// Payments that do not reconcile with total + Σtip (e.g. an under-reported
+// payment) are refused, never signed.
 func TestBuildReceipt_UnreconcilablePaymentsRefused(t *testing.T) {
 	_, err := BuildReceipt(Request{
 		Total:        1190,

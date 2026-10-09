@@ -16,7 +16,7 @@ const realEnvelope = `{
     "currency": "EUR",
     "total": 1290,
     "tendered_at": "2026-08-15T10:31:02Z",
-    "payments": [{"method": "card", "amount": 1190, "tip_amount": 100}],
+    "payments": [{"method": "card", "amount": 1390, "tip_amount": 100}],
     "vat_breakdown": [
       {"rate_bp": 700,  "net": 500, "tax": 35},
       {"rate_bp": 1900, "net": 700, "tax": 133}
@@ -38,7 +38,7 @@ func TestParseRequest_RealEnvelope(t *testing.T) {
 	if req.Retry {
 		t.Error("Retry should default false when the field is absent")
 	}
-	if len(req.Payments) != 1 || req.Payments[0].Amount != 1190 || req.Payments[0].TipAmount != 100 {
+	if len(req.Payments) != 1 || req.Payments[0].Amount != 1390 || req.Payments[0].TipAmount != 100 {
 		t.Errorf("Payments = %+v", req.Payments)
 	}
 	if len(req.VATBreakdown) != 2 {

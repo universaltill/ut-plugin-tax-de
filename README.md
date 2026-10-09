@@ -423,8 +423,14 @@ researched (with sources) on ut-docs#833:
   `standard_rate` — including an unrecognised value or a legacy stored
   `refuse`, which is no longer a treatment (ut-docs ADR-0136, #3309) — is
   read as `proportional`, with no migration needed.
-- Payments count each tip **once**, whether or not core already folded it
-  into the payment's `amount` — `total` decides which.
+- Payments count each tip **once**: since contract 1.11.0 (ut-docs#2571)
+  every payment's `amount` includes its tip, so the plugin requires
+  `Σamount = total + Σtip` to the cent (ut-docs#2976, v0.11.0) and
+  answers `cannot-sign` otherwise. A pre-1.11.0 core (universal-till
+  before v0.27.1) that leaves a reader-reported tip outside `amount` has
+  that sale refused at the till rather than signed under a guessed
+  convention — the payload carries no contract version to tell an older
+  core apart.
 
 Anything that still does not reconcile is refused with **`cannot-sign`**
 (contract 1.3.0; previously `unreachable`): since ut-docs ADR-0136
@@ -448,12 +454,6 @@ sale.
 (`REDUCED_1`), 10.7% (`SPECIAL_RATE_1`), 5.5% (`SPECIAL_RATE_2`) and 0%
 (`NULL`) are signed; any other rate (e.g. a mis-set tax code) answers
 `cannot-sign` rather than being recorded under a rate it isn't.
-
-**Known residual risk (core-side, ut-docs#2571):** core does not
-yet use one convention for whether a payment's `amount` already includes
-its tip, so the plugin decides from `total`. A reader-reported tip on a
-tender that was over-paid by exactly the tip total would be read the wrong
-way round.
 
 **`handleTaxRateAsk` (dine-in/takeaway VAT switching) is real, and is the
 one piece of this plugin verified against a real wazero-compiled run** — no
