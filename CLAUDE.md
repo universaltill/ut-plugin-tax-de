@@ -248,7 +248,15 @@ Known gaps #5/#6/#7.
   and selects a distinct fiskaly `receipt_type` (`RECEIPT` vs
   `RECEIPT_0104`) — the field existed and the branch was already written
   before this repo's `sale_type` fix landed, but nothing populated it, so
-  it was silently dead until then.
+  it was silently dead until then. **A fourth (ut-docs#2976, v0.11.0):**
+  the payments must sum to exactly `total + Σtip` — contract 1.11.0
+  (ut-docs#2571) puts every tip inside its payment's `amount` — else
+  `cannot-sign` (`TestBuildReceipt_TipOutsideAmountRefused`,
+  `TestFiscalSignAsk_TipOutsideAmountIsCannotSign`). Do not bring back
+  the old "tips on top" inference as "more tolerant": the payload has no
+  contract version and `min_pos_version` gates nothing (ut-docs#3288), so
+  inference cannot be limited to old cores, and it mis-signed a tender
+  over-paid by exactly the tip total.
 - `src/taxrate/` — the pure, host-independent half of the `tax.rate.ask`
   answerer (ut-docs#1013): the takeaway_rate_overrides lookup that
   produces Germany's (product tax class x consumption mode) VAT matrix.

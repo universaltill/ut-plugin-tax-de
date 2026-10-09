@@ -496,8 +496,8 @@ func statusOf(t *testing.T, out string, h *stubHost) string {
 	return got.Status
 }
 
-// A receipt that cannot be made to balance (here the payments cover the
-// total neither with nor without the tip) must never reach fiskaly: the
+// A receipt that cannot be made to balance (here the payments fall short of
+// total + tip) must never reach fiskaly: the
 // plugin answers cannot-sign (contract 1.3.0), not unreachable — it is not
 // an outage, and core words the two differently (ut-docs#833).
 func TestFiscalSignAsk_RefusesToSignAnUnbalancedReceipt(t *testing.T) {
@@ -516,6 +516,33 @@ func TestFiscalSignAsk_RefusesToSignAnUnbalancedReceipt(t *testing.T) {
 	out, h := run(t, wasm, configuredHost(scriptedFiskaly(t)), unbalanced)
 	if s := statusOf(t, out, h); s != "cannot-sign" {
 		t.Errorf("status = %q, want cannot-sign for an unbalanced receipt", s)
+	}
+	if len(h.calls) != 0 {
+		t.Errorf("contacted fiskaly %d times for a receipt it should have refused outright", len(h.calls))
+	}
+}
+
+// Contract 1.11.0 (ut-docs#2571, #2976): a payment's amount always includes
+// its tip. A tipped leg whose amount equals the total (the pre-1.11.0
+// reader-reported shape) breaks Σamount == total + Σtip, so the compiled
+// plugin answers cannot-sign without contacting fiskaly instead of guessing
+// the tip sits on top.
+func TestFiscalSignAsk_TipOutsideAmountIsCannotSign(t *testing.T) {
+	wasm := buildWasm(t)
+	const tipOnTop = `{
+	  "type": "fiscal.sign.ask",
+	  "payload": {
+	    "sale_id": "sale-tip-on-top",
+	    "currency": "EUR",
+	    "total": 1290,
+	    "tax_inclusive": true,
+	    "payments": [{"method": "card", "amount": 1290, "tip_amount": 110, "tip_recipient": "employee"}],
+	    "vat_breakdown": [{"rate_bp": 1900, "net": 1290, "tax": 206}]
+	  }
+	}`
+	out, h := run(t, wasm, configuredHost(scriptedFiskaly(t)), tipOnTop)
+	if s := statusOf(t, out, h); s != "cannot-sign" {
+		t.Errorf("status = %q, want cannot-sign for a tip outside amount", s)
 	}
 	if len(h.calls) != 0 {
 		t.Errorf("contacted fiskaly %d times for a receipt it should have refused outright", len(h.calls))

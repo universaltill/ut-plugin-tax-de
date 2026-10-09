@@ -21,7 +21,8 @@
 //     part a second provider would replace.
 //
 // Contract: ut-docs/reference/contracts/fiscal-sign-ask.md, tracking through
-// v1.10.0 (ut-docs#2880's `receipt` object on approved is the latest addition).
+// v1.11.0 (ut-docs#2571: every payment's amount includes its tip, asserted
+// by BuildReceipt since ut-docs#2976).
 package fiscalsign
 
 import (
@@ -45,8 +46,9 @@ const (
 )
 
 // Payment is one payment on the sale. Amount is NET of change given (what
-// was actually collected under this method); TipAmount is separate and
-// additive, exactly as on the receipt.
+// was actually collected under this method) and, since contract 1.11.0
+// (ut-docs#2571), always INCLUDES TipAmount — TipAmount says how much of
+// Amount is tip, it is never added on top.
 type Payment struct {
 	Method    string `json:"method"`
 	Amount    int64  `json:"amount"`
@@ -67,7 +69,7 @@ type VATLine struct {
 }
 
 // Request is the `fiscal.sign.ask` payload (contract v1.1.0+, currently
-// tracking v1.9.0). Money is in integer minor units throughout.
+// tracking v1.11.0). Money is in integer minor units throughout.
 type Request struct {
 	SaleID       string    `json:"sale_id"`
 	Currency     string    `json:"currency"`

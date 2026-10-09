@@ -93,11 +93,13 @@ const standardRateBP = 1900
 //     NULL;
 //   - a rate with no DSFinV-K bucket (anything but 19/7/10.7/5.5/0%) is
 //     refused, never signed under another rate;
-//   - the payment side counts each tip exactly once, whether or not core
-//     already folded it into the payment's amount (both conventions exist
-//     in core; `total` decides which one this request uses). Residual
-//     risk, until core sends one convention (ut-docs#2571): a reader-reported tip on a tender over-paid by
-//     exactly the tip total reads as "tip inside amount".
+//   - the payment side counts each tip exactly once: since contract
+//     1.11.0 (ut-docs#2571) every payment's amount already includes its
+//     tip, so the payments must sum to exactly `total + Σtip`
+//     (ut-docs#2976). Any other sum — including the pre-1.11.0
+//     reader-reported shape, tip outside amount — is refused rather than
+//     signed under a guessed convention. The payload carries no contract
+//     version to tell an older core apart, so there is no fallback.
 //
 // Anything that does not reconcile returns ErrCannotSign.
 func BuildReceipt(req Request, opt Options) (Receipt, error) {
@@ -114,25 +116,15 @@ func BuildReceipt(req Request, opt Options) (Receipt, error) {
 		paid += p.Amount
 		tips += p.TipAmount
 	}
-	var amountsIncludeTips bool
-	switch {
-	case paid == req.Total:
-		amountsIncludeTips = false
-	case paid == req.Total+tips:
-		amountsIncludeTips = true
-	default:
-		return Receipt{}, fmt.Errorf("%w: payments %d reconcile with total %d neither with nor without tips %d", ErrCannotSign, paid, req.Total, tips)
+	if paid != req.Total+tips {
+		return Receipt{}, fmt.Errorf("%w: payments %d != total %d + tips %d (contract 1.11.0: amount includes the tip)", ErrCannotSign, paid, req.Total, tips)
 	}
 
 	saleGross := copyBuckets(gross)
 	payBuckets := map[string]int64{}
 	var employeeTips, businessTips int64
 	for _, p := range req.Payments {
-		collected := p.Amount
-		if !amountsIncludeTips {
-			collected += p.TipAmount
-		}
-		payBuckets[PaymentTypeBucket(p.Method)] += collected
+		payBuckets[PaymentTypeBucket(p.Method)] += p.Amount
 		switch p.TipRecipient {
 		case "", TipRecipientEmployee:
 			employeeTips += p.TipAmount
