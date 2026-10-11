@@ -7,10 +7,10 @@ jobs:
   validate:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
-          go-version: "1.27"
+          go-version-file: go.mod
       - name: go vet
         # Cross-compiled to match scripts/build.sh's actual GOOS/GOARCH: this
         # plugin's entry point is behind a `//go:build wasip1` tag, so host
@@ -40,7 +40,7 @@ jobs:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           # Need history back to the PR base, not just a shallow tip.
           fetch-depth: 0
