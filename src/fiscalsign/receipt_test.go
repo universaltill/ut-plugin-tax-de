@@ -2,6 +2,7 @@ package fiscalsign
 
 import (
 	"errors"
+	"math"
 	"strings"
 	"testing"
 )
@@ -431,5 +432,128 @@ func TestBuildReceipt_InclusiveFlagOnExclusiveNumbersRefused(t *testing.T) {
 	}, Options{})
 	if !errors.Is(err, ErrCannotSign) {
 		t.Fatalf("err = %v, want ErrCannotSign", err)
+	}
+}
+
+// ut-docs#4232 (contract 1.14.0): a multi-purpose voucher (Mehrzweck-
+// gutschein) sold in the sale is in `total` but not in `vat_breakdown`; it
+// is not taxable at issue (DSFinV-K MehrzweckgutscheinKauf, USt-Schlüssel
+// 5), so it is signed in the NULL bucket and never touched by the sale
+// discount.
+
+func TestBuildReceipt_VoucherOnlySaleSignsInNULL(t *testing.T) {
+	r := mustBuild(t, Request{
+		Total:         2500,
+		TaxInclusive:  boolPtr(true),
+		Payments:      []Payment{{Method: "card", Amount: 2500}},
+		VoucherIssues: []VoucherIssue{{Purpose: VoucherPurposeMulti, Amount: 2500}},
+	}, Options{})
+	if v := vatMap(r); v["NULL"] != "25.00" || len(v) != 1 {
+		t.Fatalf("VAT = %v", v)
+	}
+	if p := payMap(r); p["NON_CASH"] != "25.00" || len(p) != 1 {
+		t.Fatalf("payments = %v", p)
+	}
+}
+
+// Goods + voucher with a sale discount: the discount is split across the
+// goods' rates only, the voucher keeps its full face value — and the
+// inclusive/exclusive inference (no flag) still finds the right reading.
+func TestBuildReceipt_GoodsPlusVoucherWithDiscount(t *testing.T) {
+	for _, flag := range []*bool{boolPtr(true), nil} {
+		r := mustBuild(t, Request{
+			Total:         5990,
+			TaxInclusive:  flag,
+			SaleDiscount:  200,
+			Payments:      []Payment{{Method: "cash", Amount: 5990}},
+			VATBreakdown:  []VATLine{{RateBP: 1900, Net: 1190, Tax: 190}},
+			VoucherIssues: []VoucherIssue{{Purpose: VoucherPurposeMulti, Amount: 5000}},
+		}, Options{})
+		if v := vatMap(r); v["NORMAL"] != "9.90" || v["NULL"] != "50.00" || len(v) != 2 {
+			t.Fatalf("flag=%v: VAT = %v", flag, v)
+		}
+	}
+}
+
+// A business tip is turnover: a voucher in NULL must not attract a share
+// of it (proportional treatment weights taxable rates only).
+func TestBuildReceipt_VoucherDoesNotWeightBusinessTip(t *testing.T) {
+	r := mustBuild(t, Request{
+		Total:         2700,
+		TaxInclusive:  boolPtr(true),
+		Payments:      []Payment{{Method: "card", Amount: 2800, TipAmount: 100, TipRecipient: TipRecipientBusiness}},
+		VATBreakdown:  []VATLine{{RateBP: 700, Net: 700, Tax: 46}},
+		VoucherIssues: []VoucherIssue{{Purpose: VoucherPurposeMulti, Amount: 2000}},
+	}, Options{})
+	if v := vatMap(r); v["REDUCED_1"] != "8.00" || v["NULL"] != "20.00" || len(v) != 2 {
+		t.Fatalf("VAT = %v", v)
+	}
+}
+
+// A single-purpose voucher is already a taxed band in vat_breakdown; its
+// voucher_issues entry is informational and must not be counted again.
+func TestBuildReceipt_SinglePurposeVoucherAlreadyInBreakdown(t *testing.T) {
+	r := mustBuild(t, Request{
+		Total:         1000,
+		TaxInclusive:  boolPtr(true),
+		Payments:      []Payment{{Method: "cash", Amount: 1000}},
+		VATBreakdown:  []VATLine{{RateBP: 1900, Net: 1000, Tax: 160}},
+		VoucherIssues: []VoucherIssue{{Purpose: VoucherPurposeSingle, Amount: 1000, RateBP: 1900}},
+	}, Options{})
+	if v := vatMap(r); v["NORMAL"] != "10.00" || len(v) != 1 {
+		t.Fatalf("VAT = %v", v)
+	}
+}
+
+// A single-purpose entry counted again (as if multi-purpose) would push
+// the goods part below total; reading it as informational must sign.
+func TestBuildReceipt_SinglePurposeVoucherNotCountedTwice(t *testing.T) {
+	r := mustBuild(t, Request{
+		Total:         1290,
+		TaxInclusive:  boolPtr(true),
+		Payments:      []Payment{{Method: "cash", Amount: 1290}},
+		VATBreakdown:  []VATLine{{RateBP: 700, Net: 290, Tax: 19}, {RateBP: 1900, Net: 1000, Tax: 160}},
+		VoucherIssues: []VoucherIssue{{Purpose: VoucherPurposeSingle, Amount: 1000, RateBP: 1900}},
+	}, Options{})
+	if v := vatMap(r); v["NULL"] != "" || v["NORMAL"] != "10.00" || v["REDUCED_1"] != "2.90" {
+		t.Fatalf("VAT = %v", v)
+	}
+}
+
+func TestBuildReceipt_RefusesOverflowingVoucherTotal(t *testing.T) {
+	_, err := BuildReceipt(Request{
+		Total:        1000,
+		TaxInclusive: boolPtr(true),
+		Payments:     []Payment{{Method: "cash", Amount: 1000}},
+		VATBreakdown: []VATLine{{RateBP: 1900, Net: 1000, Tax: 160}},
+		VoucherIssues: []VoucherIssue{
+			{Purpose: VoucherPurposeMulti, Amount: math.MaxInt64},
+			{Purpose: VoucherPurposeMulti, Amount: math.MaxInt64},
+			{Purpose: VoucherPurposeMulti, Amount: 2},
+		},
+	}, Options{})
+	if !errors.Is(err, ErrCannotSign) {
+		t.Fatalf("want ErrCannotSign, got %v", err)
+	}
+}
+
+func TestBuildReceipt_RefusesMalformedVoucherIssue(t *testing.T) {
+	for name, vi := range map[string]VoucherIssue{
+		"unknown purpose": {Purpose: "gift", Amount: 500},
+		"zero amount":     {Purpose: VoucherPurposeMulti, Amount: 0},
+		"negative amount": {Purpose: VoucherPurposeMulti, Amount: -500},
+	} {
+		// The goods reconcile on their own, so the only reason to refuse
+		// is the malformed voucher entry (a reader ignoring it would sign).
+		_, err := BuildReceipt(Request{
+			Total:         1000,
+			TaxInclusive:  boolPtr(true),
+			Payments:      []Payment{{Method: "cash", Amount: 1000}},
+			VATBreakdown:  []VATLine{{RateBP: 1900, Net: 1000, Tax: 160}},
+			VoucherIssues: []VoucherIssue{vi},
+		}, Options{})
+		if !errors.Is(err, ErrCannotSign) {
+			t.Fatalf("%s: want ErrCannotSign, got %v", name, err)
+		}
 	}
 }

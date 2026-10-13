@@ -3,6 +3,7 @@ package fiscalsign
 import (
 	"errors"
 	"fmt"
+	"math"
 	"sort"
 	"strings"
 )
@@ -91,6 +92,12 @@ const standardRateBP = 1900
 //     Options.BusinessTip — at 19% for BusinessTipStandardRate, otherwise
 //     proportionally across the sale's taxable rates only, never into
 //     NULL;
+//   - a multi-purpose voucher sold in the sale (contract 1.14.0,
+//     ut-docs#4232; DSFinV-K MehrzweckgutscheinKauf, USt-Schlüssel 5) is
+//     in `total` but not in `vat_breakdown`: it is not taxable at issue,
+//     so it goes in the NULL bucket, untouched by the sale discount and
+//     never weighting a business tip. A single-purpose voucher is already
+//     a taxed band in `vat_breakdown` and needs nothing more;
 //   - a rate with no DSFinV-K bucket (anything but 19/7/10.7/5.5/0%) is
 //     refused, never signed under another rate;
 //   - the payment side counts each tip exactly once: since contract
@@ -103,7 +110,11 @@ const standardRateBP = 1900
 //
 // Anything that does not reconcile returns ErrCannotSign.
 func BuildReceipt(req Request, opt Options) (Receipt, error) {
-	gross, err := discountedGrossByRate(req)
+	vouchers, err := multiPurposeVoucherTotal(req.VoucherIssues)
+	if err != nil {
+		return Receipt{}, err
+	}
+	gross, err := discountedGrossByRate(req, vouchers)
 	if err != nil {
 		return Receipt{}, err
 	}
@@ -135,7 +146,7 @@ func BuildReceipt(req Request, opt Options) (Receipt, error) {
 		}
 	}
 
-	gross[0] += employeeTips
+	gross[0] += employeeTips + vouchers
 	if businessTips > 0 {
 		switch opt.BusinessTip {
 		case BusinessTipStandardRate:
@@ -190,9 +201,34 @@ func BuildReceipt(req Request, opt Options) (Receipt, error) {
 	return r, nil
 }
 
+// multiPurposeVoucherTotal sums the multi-purpose vouchers in the sale,
+// refusing an entry it cannot read rather than signing around it.
+func multiPurposeVoucherTotal(issues []VoucherIssue) (int64, error) {
+	var sum int64
+	for _, v := range issues {
+		if v.Amount <= 0 {
+			return 0, fmt.Errorf("%w: voucher issue amount %d must be > 0", ErrCannotSign, v.Amount)
+		}
+		switch v.Purpose {
+		case VoucherPurposeMulti:
+			if sum > math.MaxInt64-v.Amount {
+				return 0, fmt.Errorf("%w: voucher issue total overflows", ErrCannotSign)
+			}
+			sum += v.Amount
+		case VoucherPurposeSingle:
+			// Already a taxed band in vat_breakdown.
+		default:
+			return 0, fmt.Errorf("%w: unknown voucher purpose %q", ErrCannotSign, v.Purpose)
+		}
+	}
+	return sum, nil
+}
+
 // discountedGrossByRate returns the gross per basis-point rate after the
-// sale-level discount, and fails unless it sums to `total`.
-func discountedGrossByRate(req Request) (map[int]int64, error) {
+// sale-level discount, and fails unless it sums to `total` less the
+// multi-purpose vouchers (which are in `total` but in no rate).
+func discountedGrossByRate(req Request, vouchers int64) (map[int]int64, error) {
+	goodsTotal := req.Total - vouchers
 	if req.SaleDiscount < 0 {
 		return nil, fmt.Errorf("%w: negative sale_discount", ErrCannotSign)
 	}
@@ -205,7 +241,7 @@ func discountedGrossByRate(req Request) (map[int]int64, error) {
 	switch {
 	case req.TaxInclusive != nil:
 		inclusive = *req.TaxInclusive
-	case sumNet-req.SaleDiscount == req.Total:
+	case sumNet-req.SaleDiscount == goodsTotal:
 		inclusive = true // also the zero-rated case, where both readings agree
 	default:
 		inclusive = false
@@ -231,8 +267,8 @@ func discountedGrossByRate(req Request) (map[int]int64, error) {
 	for _, g := range gross {
 		sum += g
 	}
-	if sum != req.Total {
-		return nil, fmt.Errorf("%w: gross per rate sums to %d, total is %d", ErrCannotSign, sum, req.Total)
+	if sum != goodsTotal {
+		return nil, fmt.Errorf("%w: gross per rate sums to %d, total less multi-purpose vouchers is %d", ErrCannotSign, sum, goodsTotal)
 	}
 	return gross, nil
 }

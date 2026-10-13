@@ -423,6 +423,15 @@ researched (with sources) on ut-docs#833:
   `standard_rate` — including an unrecognised value or a legacy stored
   `refuse`, which is no longer a treatment (ut-docs ADR-0136, #3309) — is
   read as `proportional`, with no migration needed.
+- **Multi-purpose voucher sold** (`Mehrzweckgutschein`, DSFinV-K
+  `MehrzweckgutscheinKauf`, USt-Schlüssel 5 — not taxable until it is
+  redeemed, §3 Abs. 15 UStG): core sends it in `voucher_issues` (contract
+  1.14.0, ut-docs#4232) and in `total`, never in `vat_breakdown`. It is
+  signed in the `NULL` bucket, keeps its full face value whatever the sale
+  discount, and never weights a business tip (v0.12.0). A **single-purpose
+  voucher** (`Einzweckgutschein`) is taxed at issue and already arrives as a
+  band in `vat_breakdown`. An unknown purpose or a non-positive amount is
+  refused with `cannot-sign`.
 - Payments count each tip **once**: since contract 1.11.0 (ut-docs#2571)
   every payment's `amount` includes its tip, so the plugin requires
   `Σamount = total + Σtip` to the cent (ut-docs#2976, v0.11.0) and

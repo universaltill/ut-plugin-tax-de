@@ -21,8 +21,9 @@
 //     part a second provider would replace.
 //
 // Contract: ut-docs/reference/contracts/fiscal-sign-ask.md, tracking through
-// v1.11.0 (ut-docs#2571: every payment's amount includes its tip, asserted
-// by BuildReceipt since ut-docs#2976).
+// v1.14.0 (ut-docs#2571: every payment's amount includes its tip, asserted
+// by BuildReceipt since ut-docs#2976; ut-docs#4232: multi-purpose vouchers
+// in `voucher_issues`).
 package fiscalsign
 
 import (
@@ -68,8 +69,24 @@ type VATLine struct {
 	Tax    int64 `json:"tax"`
 }
 
+// Voucher purposes core sends in `voucher_issues` (contract 1.14.0,
+// ut-docs#4232) — the till's own stored values.
+const (
+	VoucherPurposeMulti  = "multi_purpose"
+	VoucherPurposeSingle = "single_purpose"
+)
+
+// VoucherIssue is one voucher sold in the sale (contract 1.14.0). A
+// multi-purpose one is in Total but not in VATBreakdown; a single-purpose
+// one is already a taxed band in VATBreakdown at RateBP.
+type VoucherIssue struct {
+	Purpose string `json:"purpose"`
+	Amount  int64  `json:"amount"`
+	RateBP  int    `json:"rate_bp"`
+}
+
 // Request is the `fiscal.sign.ask` payload (contract v1.1.0+, currently
-// tracking v1.11.0). Money is in integer minor units throughout.
+// tracking v1.14.0). Money is in integer minor units throughout.
 type Request struct {
 	SaleID       string    `json:"sale_id"`
 	Currency     string    `json:"currency"`
@@ -96,6 +113,9 @@ type Request struct {
 	TaxInclusive  *bool `json:"tax_inclusive"`
 	SaleDiscount  int64 `json:"sale_discount"`
 	ServiceCharge int64 `json:"service_charge"`
+	// VoucherIssues (contract 1.14.0, ut-docs#4232) is absent from an
+	// older core, which never put a voucher in Total either.
+	VoucherIssues []VoucherIssue `json:"voucher_issues"`
 }
 
 // IsReturn reports whether this request is for a refund/return, treating

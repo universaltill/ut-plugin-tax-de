@@ -582,6 +582,41 @@ func TestFiscalSignAsk_EmployeeTipSignsInNullBucket(t *testing.T) {
 	}
 }
 
+// ut-docs#4232 (contract 1.14.0): a coffee plus a €50 multi-purpose
+// voucher, as core now sends it — the voucher in total and voucher_issues,
+// not in vat_breakdown. It SIGNS: the voucher is MehrzweckgutscheinKauf
+// (not taxable at issue) in the NULL bucket, the coffee in NORMAL, and the
+// Beleg's halves agree (2.90 + 50.00 = 52.90).
+func TestFiscalSignAsk_MultiPurposeVoucherSignsInNullBucket(t *testing.T) {
+	wasm := buildWasm(t)
+	const voucherSale = `{
+	  "type": "fiscal.sign.ask",
+	  "payload": {
+	    "sale_id": "sale-voucher",
+	    "currency": "EUR",
+	    "total": 5290,
+	    "tax_inclusive": true,
+	    "payments": [{"method": "cash", "amount": 5290, "tip_amount": 0}],
+	    "vat_breakdown": [{"rate_bp": 1900, "net": 290, "tax": 46}],
+	    "voucher_issues": [{"purpose": "multi_purpose", "amount": 5000, "rate_bp": 0}]
+	  }
+	}`
+	out, h := run(t, wasm, configuredHost(scriptedFiskaly(t)), voucherSale)
+	if s := statusOf(t, out, h); s != "approved" {
+		t.Fatalf("status = %q, want approved (logs: %v)", s, h.logs)
+	}
+	body := strings.ReplaceAll(h.calls[2].Body(), " ", "")
+	for _, want := range []string{
+		`{"vat_rate":"NORMAL","amount":"2.90"}`,
+		`{"vat_rate":"NULL","amount":"50.00"}`,
+		`{"payment_type":"CASH","amount":"52.90"}`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("finish body missing %s\nbody: %s", want, body)
+		}
+	}
+}
+
 // ADR-0136 Decision 7 (ut-docs#3309): a tip the business keeps, with the
 // merchant's stored setting still at the legacy "refuse" value — no longer
 // a treatment, read as proportional with no migration. The plugin signs
