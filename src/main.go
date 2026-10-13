@@ -563,7 +563,9 @@ func handleFiscalSignAsk(raw []byte) {
 	// ut-docs#833 — whole-bill discount split across rates by gross
 	// (Rabatt), employee tip in the 0%/NULL bucket (TrinkgeldAN), business
 	// tip per the merchant's tip_business_vat_treatment setting
-	// (TrinkgeldAG) — and refuses anything that still does not reconcile.
+	// (TrinkgeldAG), a multi-purpose voucher sold in the sale in NULL
+	// (MehrzweckgutscheinKauf, ut-docs#4232) — and refuses anything that
+	// still does not reconcile.
 	//
 	// A TSE signature cannot be corrected afterwards, so a receipt known
 	// to misstate the sale is never signed: answer cannot-sign (contract
