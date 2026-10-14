@@ -407,8 +407,14 @@ equal. `fiscalsign.BuildReceipt` makes them equal using the treatments
 researched (with sources) on ut-docs#833:
 
 - **Whole-bill discount** (DSFinV-K `Rabatt`, UStAE 10.3): split across the
-  sale's VAT rates in proportion to each rate's gross — floors, remainder on
-  the highest rate — the contract's and core's own VAT-invoice convention.
+  sale's VAT rates in proportion to each rate's **goods** gross — floors,
+  remainder on the highest rate carrying goods — the contract's and core's
+  own `pos.VATBandsForSale` convention. Since v0.12.1 (contract 1.14.1,
+  ut-docs#4240) a single-purpose voucher sold in the same sale is not goods:
+  it takes no share and keeps the gross it was issued with, so the signed
+  split matches the till's receipt, invoice and Z report. A sale with no
+  goods at all falls back to every band's full gross, as core does; a
+  discount that would take any band below zero is refused (`cannot-sign`).
 - **Service charge**: already inside `vat_breakdown` (core, contract 1.5.0);
   never applied twice.
 - **Tip to the employee** (`TrinkgeldAN`, USt-Schlüssel 5 — not the

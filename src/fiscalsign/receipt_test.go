@@ -557,3 +557,155 @@ func TestBuildReceipt_RefusesMalformedVoucherIssue(t *testing.T) {
 		}
 	}
 }
+
+// Contract 1.14.1 (ut-docs#4233, #4240): the sale discount is apportioned
+// over each band's GOODS gross only. A single-purpose voucher sold in the
+// sale keeps the gross it was issued with, so the signed split matches
+// core's own banding (pos.VATBandsForSale: receipt, invoice, Z report).
+// The card's case: goods 100.00 @19% + single-purpose voucher 50.00 @7%,
+// 10% (10.00) discount.
+func TestBuildReceipt_SaleDiscountSkipsSinglePurposeVoucher(t *testing.T) {
+	sp := []VoucherIssue{{Purpose: VoucherPurposeSingle, Amount: 5000, RateBP: 700}}
+	t.Run("inclusive", func(t *testing.T) {
+		r := mustBuild(t, Request{
+			Total:         14000,
+			TaxInclusive:  boolPtr(true),
+			SaleDiscount:  1000,
+			Payments:      []Payment{{Method: "cash", Amount: 14000}},
+			VATBreakdown:  []VATLine{{RateBP: 700, Net: 5000, Tax: 327}, {RateBP: 1900, Net: 10000, Tax: 1597}},
+			VoucherIssues: sp,
+		}, Options{})
+		if v := vatMap(r); v["NORMAL"] != "90.00" || v["REDUCED_1"] != "50.00" || len(v) != 2 {
+			t.Fatalf("VAT = %v, want NORMAL 90.00 / REDUCED_1 50.00", v)
+		}
+	})
+	t.Run("exclusive", func(t *testing.T) {
+		// net 150.00 − 10.00 + tax 22.50
+		r := mustBuild(t, Request{
+			Total:         16250,
+			TaxInclusive:  boolPtr(false),
+			SaleDiscount:  1000,
+			Payments:      []Payment{{Method: "cash", Amount: 16250}},
+			VATBreakdown:  []VATLine{{RateBP: 700, Net: 5000, Tax: 350}, {RateBP: 1900, Net: 10000, Tax: 1900}},
+			VoucherIssues: sp,
+		}, Options{})
+		// 19%: net 90.00 + VAT 19.00; 7%: net 50.00 + VAT 3.50.
+		if v := vatMap(r); v["NORMAL"] != "109.00" || v["REDUCED_1"] != "53.50" || len(v) != 2 {
+			t.Fatalf("VAT = %v, want NORMAL 109.00 / REDUCED_1 53.50", v)
+		}
+	})
+}
+
+// The remainder goes to the highest band whose goods gross is > 0 — never
+// to a band holding only a single-purpose voucher, even the highest rate.
+func TestBuildReceipt_DiscountRemainderSkipsVoucherOnlyBand(t *testing.T) {
+	// goods 1.00 @7% + 2.00 @10.7%, voucher 10.00 @19%, 1.00 off:
+	// shares 33 (floor) / 67 (remainder on 10.7%, not 19%).
+	r := mustBuild(t, Request{
+		Total:        1200,
+		TaxInclusive: boolPtr(true),
+		SaleDiscount: 100,
+		Payments:     []Payment{{Method: "cash", Amount: 1200}},
+		VATBreakdown: []VATLine{
+			{RateBP: 700, Net: 100, Tax: 6},
+			{RateBP: 1070, Net: 200, Tax: 19},
+			{RateBP: 1900, Net: 1000, Tax: 160},
+		},
+		VoucherIssues: []VoucherIssue{{Purpose: VoucherPurposeSingle, Amount: 1000, RateBP: 1900}},
+	}, Options{})
+	if v := vatMap(r); v["REDUCED_1"] != "0.67" || v["SPECIAL_RATE_1"] != "1.33" || v["NORMAL"] != "10.00" {
+		t.Fatalf("VAT = %v, want REDUCED_1 0.67 / SPECIAL_RATE_1 1.33 / NORMAL 10.00", v)
+	}
+}
+
+// Goods and a single-purpose voucher in the SAME band: only the goods part
+// carries that band's share; the voucher part is added back unchanged.
+func TestBuildReceipt_DiscountSharedBandWeightsGoodsOnly(t *testing.T) {
+	// 7%: goods 1.00; 19%: goods 2.00 + voucher 10.00. 1.00 off →
+	// weights 100 / 200 (not 1200): 33 / 67.
+	r := mustBuild(t, Request{
+		Total:         1200,
+		TaxInclusive:  boolPtr(true),
+		SaleDiscount:  100,
+		Payments:      []Payment{{Method: "cash", Amount: 1200}},
+		VATBreakdown:  []VATLine{{RateBP: 700, Net: 100, Tax: 6}, {RateBP: 1900, Net: 1200, Tax: 191}},
+		VoucherIssues: []VoucherIssue{{Purpose: VoucherPurposeSingle, Amount: 1000, RateBP: 1900}},
+	}, Options{})
+	if v := vatMap(r); v["REDUCED_1"] != "0.67" || v["NORMAL"] != "11.33" {
+		t.Fatalf("VAT = %v, want REDUCED_1 0.67 / NORMAL 11.33", v)
+	}
+}
+
+// Exclusive pricing: a single-purpose voucher's gross is its amount (the
+// net) plus its own tax, rounded half-up — so a 0.50 voucher @19% weighs
+// 0.60 (0.095 → 0.10), leaving the 7% goods all of the discount.
+func TestBuildReceipt_ExclusiveVoucherGrossIncludesRoundedTax(t *testing.T) {
+	// 7%: goods net 1.00 tax 0.07; 19%: voucher net 0.50 tax 0.10.
+	// total = 150 − 50 + 17 = 117.
+	r := mustBuild(t, Request{
+		Total:         117,
+		TaxInclusive:  boolPtr(false),
+		SaleDiscount:  50,
+		Payments:      []Payment{{Method: "cash", Amount: 117}},
+		VATBreakdown:  []VATLine{{RateBP: 700, Net: 100, Tax: 7}, {RateBP: 1900, Net: 50, Tax: 10}},
+		VoucherIssues: []VoucherIssue{{Purpose: VoucherPurposeSingle, Amount: 50, RateBP: 1900}},
+	}, Options{})
+	if v := vatMap(r); v["REDUCED_1"] != "0.57" || v["NORMAL"] != "0.60" {
+		t.Fatalf("VAT = %v, want REDUCED_1 0.57 / NORMAL 0.60", v)
+	}
+}
+
+// No goods at all but a discount (the basket caps a discount at the goods,
+// but another CompleteSale caller can still send one): core falls back to
+// every band's full gross, so the signer does too.
+func TestBuildReceipt_DiscountWithNoGoodsFallsBackToFullGross(t *testing.T) {
+	r := mustBuild(t, Request{
+		Total:         900,
+		TaxInclusive:  boolPtr(true),
+		SaleDiscount:  100,
+		Payments:      []Payment{{Method: "cash", Amount: 900}},
+		VATBreakdown:  []VATLine{{RateBP: 1900, Net: 1000, Tax: 160}},
+		VoucherIssues: []VoucherIssue{{Purpose: VoucherPurposeSingle, Amount: 1000, RateBP: 1900}},
+	}, Options{})
+	if v := vatMap(r); v["NORMAL"] != "9.00" || len(v) != 1 {
+		t.Fatalf("VAT = %v", v)
+	}
+}
+
+// A single-purpose voucher worth more than its band (or at a rate the
+// breakdown doesn't have) means the payload contradicts itself: refuse.
+func TestBuildReceipt_RefusesVoucherLargerThanItsBand(t *testing.T) {
+	for name, vi := range map[string]VoucherIssue{
+		"larger than band": {Purpose: VoucherPurposeSingle, Amount: 1500, RateBP: 1900},
+		"rate not in band": {Purpose: VoucherPurposeSingle, Amount: 500, RateBP: 700},
+	} {
+		_, err := BuildReceipt(Request{
+			Total:         900,
+			TaxInclusive:  boolPtr(true),
+			SaleDiscount:  100,
+			Payments:      []Payment{{Method: "cash", Amount: 900}},
+			VATBreakdown:  []VATLine{{RateBP: 1900, Net: 1000, Tax: 160}},
+			VoucherIssues: []VoucherIssue{vi},
+		}, Options{})
+		if !errors.Is(err, ErrCannotSign) {
+			t.Fatalf("%s: want ErrCannotSign, got %v", name, err)
+		}
+	}
+}
+
+// A discount larger than the goods next to a single-purpose voucher (a
+// tender discount the basket didn't cap): the voucher props total up, so
+// the sum still reconciles — but a negative band must never be signed.
+func TestBuildReceipt_RefusesDiscountTakingGoodsBandNegative(t *testing.T) {
+	_, err := BuildReceipt(Request{
+		Total:         900,
+		TaxInclusive:  boolPtr(true),
+		SaleDiscount:  600,
+		Payments:      []Payment{{Method: "cash", Amount: 900}},
+		VATBreakdown:  []VATLine{{RateBP: 700, Net: 500, Tax: 33}, {RateBP: 1900, Net: 1000, Tax: 160}},
+		VoucherIssues: []VoucherIssue{{Purpose: VoucherPurposeSingle, Amount: 1000, RateBP: 1900}},
+	}, Options{})
+	if !errors.Is(err, ErrCannotSign) {
+		t.Fatalf("want ErrCannotSign, got %v", err)
+	}
+}

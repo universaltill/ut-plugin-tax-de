@@ -81,9 +81,11 @@ const standardRateBP = 1900
 //     read from `tax_inclusive` when core sends it, else inferred from
 //     which reading reconciles with `total`;
 //   - a sale-level discount (DSFinV-K Rabatt, UStAE 10.3) is split across
-//     the rates in proportion to their gross — floors, remainder on the
-//     highest rate — exactly as the contract and core's own VAT-invoice
-//     engine do;
+//     the rates in proportion to their GOODS gross — a single-purpose
+//     voucher sold in the sale is not goods and keeps its issue-time
+//     gross (contract 1.14.1, ut-docs#4240) — floors, remainder on the
+//     highest rate carrying goods, exactly as the contract and core's
+//     pos.VATBandsForSale do;
 //   - a service charge is already inside `vat_breakdown` (contract 1.5.0)
 //     and is never applied again;
 //   - an employee's tip (TrinkgeldAN, USt-Schlüssel 5) is not the
@@ -254,13 +256,36 @@ func discountedGrossByRate(req Request, vouchers int64) (map[int]int64, error) {
 		}
 		gross[l.RateBP] += g
 	}
+	goods, err := goodsGrossByRate(gross, req.VoucherIssues, inclusive)
+	if err != nil {
+		return nil, err
+	}
 	if req.SaleDiscount > 0 {
-		shares, err := apportion(req.SaleDiscount, gross)
+		// Contract 1.14.1 (ut-docs#4233, #4240): the discount is weighted
+		// by each band's goods gross, so a single-purpose voucher keeps the
+		// gross it was issued with. A sale with no goods at all falls back
+		// to every band's full gross, as core's pos.VATBandsForSale does.
+		weights := goods
+		var goodsSum int64
+		for _, g := range goods {
+			goodsSum += g
+		}
+		if goodsSum == 0 {
+			weights = gross
+		}
+		shares, err := apportion(req.SaleDiscount, weights)
 		if err != nil {
 			return nil, err
 		}
 		for rate, s := range shares {
 			gross[rate] -= s
+			if gross[rate] < 0 {
+				// A discount larger than a band's goods (an uncapped
+				// tender discount next to a single-purpose voucher): the
+				// voucher props up total, so the sum check below would
+				// pass. Never sign a negative band.
+				return nil, fmt.Errorf("%w: sale_discount takes rate %d bp below zero", ErrCannotSign, rate)
+			}
 		}
 	}
 	var sum int64
@@ -271,6 +296,33 @@ func discountedGrossByRate(req Request, vouchers int64) (map[int]int64, error) {
 		return nil, fmt.Errorf("%w: gross per rate sums to %d, total less multi-purpose vouchers is %d", ErrCannotSign, sum, goodsTotal)
 	}
 	return gross, nil
+}
+
+// goodsGrossByRate is each band's gross less the single-purpose vouchers
+// sold at its rate (contract 1.14.1 § sale_discount step 2): a voucher's
+// gross is its amount when inclusive; exclusive, the amount is its net, so
+// its own tax, rounded half-up, is added. A voucher worth more than its
+// band (or at a rate the breakdown lacks) contradicts the payload and is
+// refused.
+func goodsGrossByRate(gross map[int]int64, issues []VoucherIssue, inclusive bool) (map[int]int64, error) {
+	goods := copyBuckets(gross)
+	for _, v := range issues {
+		if v.Purpose != VoucherPurposeSingle {
+			continue
+		}
+		if v.RateBP < 0 || v.RateBP > 10000 || v.Amount > math.MaxInt64/10000 {
+			return nil, fmt.Errorf("%w: single-purpose voucher amount %d at rate %d bp out of range", ErrCannotSign, v.Amount, v.RateBP)
+		}
+		vg := v.Amount
+		if !inclusive {
+			vg += (v.Amount*int64(v.RateBP) + 5000) / 10000
+		}
+		goods[v.RateBP] -= vg
+		if goods[v.RateBP] < 0 {
+			return nil, fmt.Errorf("%w: single-purpose vouchers at rate %d bp exceed the band's gross", ErrCannotSign, v.RateBP)
+		}
+	}
+	return goods, nil
 }
 
 // apportion splits amount across the rates in proportion to their gross:
