@@ -83,9 +83,10 @@ const standardRateBP = 1900
 //   - a sale-level discount (DSFinV-K Rabatt, UStAE 10.3) is split across
 //     the rates in proportion to their GOODS gross — a single-purpose
 //     voucher sold in the sale is not goods and keeps its issue-time
-//     gross (contract 1.14.1, ut-docs#4240) — floors, remainder on the
-//     highest rate carrying goods, exactly as the contract and core's
-//     pos.VATBandsForSale do;
+//     gross (contract 1.14.1, ut-docs#4240) — floors capped at each
+//     band's goods, the leftover filling the bands from the highest rate
+//     down (contract 1.15.0, ut-docs#4282), exactly as the contract and
+//     core's pos.VATBandsForSale do;
 //   - a service charge is already inside `vat_breakdown` (contract 1.5.0)
 //     and is never applied again;
 //   - an employee's tip (TrinkgeldAN, USt-Schlüssel 5) is not the
@@ -249,12 +250,14 @@ func discountedGrossByRate(req Request, vouchers int64) (map[int]int64, error) {
 		inclusive = false
 	}
 	gross := map[int]int64{}
+	net := map[int]int64{}
 	for _, l := range req.VATBreakdown {
 		g := l.Net + l.Tax
 		if inclusive {
 			g = l.Net
 		}
 		gross[l.RateBP] += g
+		net[l.RateBP] += l.Net
 	}
 	goods, err := goodsGrossByRate(gross, req.VoucherIssues, inclusive)
 	if err != nil {
@@ -270,10 +273,26 @@ func discountedGrossByRate(req Request, vouchers int64) (map[int]int64, error) {
 		for _, g := range goods {
 			goodsSum += g
 		}
+		// Contract 1.15.0 (ut-docs#4277, #4282): a share never exceeds the
+		// goods it comes off — the goods gross inclusive; exclusive, the
+		// goods NET, since that is the base the discount reduces.
+		caps := copyBuckets(goods)
+		if !inclusive {
+			caps = copyBuckets(net)
+			for _, v := range req.VoucherIssues {
+				if v.Purpose == VoucherPurposeSingle {
+					caps[v.RateBP] -= v.Amount
+				}
+			}
+		}
 		if goodsSum == 0 {
 			weights = gross
+			caps = copyBuckets(gross)
+			if !inclusive {
+				caps = copyBuckets(net)
+			}
 		}
-		shares, err := apportion(req.SaleDiscount, weights)
+		shares, err := splitSaleDiscount(req.SaleDiscount, weights, caps)
 		if err != nil {
 			return nil, err
 		}
@@ -353,6 +372,54 @@ func apportion(amount int64, gross map[int]int64) (map[int]int64, error) {
 		given += s
 	}
 	shares[rates[len(rates)-1]] = amount - given
+	return shares, nil
+}
+
+// splitSaleDiscount splits a sale discount over the bands in proportion to
+// weights (each band's goods gross), mirroring core's
+// pos.splitSaleDiscount (contract 1.15.0 § sale_discount step 3,
+// ut-docs#4277): every band with weight > 0 gets floor(d × w / Σw), capped
+// at caps; the minor units left over fill the bands from the highest rate
+// down, each up to its cap; anything still left (a discount larger than
+// every band's goods) goes on the highest-rate band with weight > 0, so
+// the shares always sum to d — the caller then refuses the negative band.
+// Like the weights, the exclusive cap is read from the payload's net, which
+// already holds the service charge's part (contract 1.5.0); core caps
+// before folding the charge in (§ sale_discount step 1, pre-existing).
+func splitSaleDiscount(d int64, weights, caps map[int]int64) (map[int]int64, error) {
+	rates := make([]int, 0, len(weights))
+	var total int64
+	for rate, w := range weights {
+		if w < 0 {
+			return nil, fmt.Errorf("%w: negative gross at rate %d", ErrCannotSign, rate)
+		}
+		if w > 0 {
+			rates = append(rates, rate)
+			total += w
+		}
+	}
+	if total == 0 {
+		return nil, fmt.Errorf("%w: nothing to apportion %d across", ErrCannotSign, d)
+	}
+	sort.Ints(rates)
+	shares := map[int]int64{}
+	remaining := d
+	for _, rate := range rates {
+		s := min(d*weights[rate]/total, max(caps[rate], 0))
+		shares[rate] = s
+		remaining -= s
+	}
+	for i := len(rates) - 1; i >= 0 && remaining > 0; i-- {
+		rate := rates[i]
+		if room := caps[rate] - shares[rate]; room > 0 {
+			take := min(room, remaining)
+			shares[rate] += take
+			remaining -= take
+		}
+	}
+	if remaining != 0 {
+		shares[rates[len(rates)-1]] += remaining
+	}
 	return shares, nil
 }
 

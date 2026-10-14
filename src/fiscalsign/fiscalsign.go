@@ -86,7 +86,7 @@ type VoucherIssue struct {
 }
 
 // Request is the `fiscal.sign.ask` payload (contract v1.1.0+, currently
-// tracking v1.14.1). Money is in integer minor units throughout.
+// tracking v1.15.0). Money is in integer minor units throughout.
 type Request struct {
 	SaleID       string    `json:"sale_id"`
 	Currency     string    `json:"currency"`
