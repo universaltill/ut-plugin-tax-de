@@ -88,7 +88,11 @@ const standardRateBP = 1900
 //     down (contract 1.15.0, ut-docs#4282), exactly as the contract and
 //     core's pos.VATBandsForSale do;
 //   - a service charge is already inside `vat_breakdown` (contract 1.5.0)
-//     and is never applied again;
+//     and is never applied again; each band's charge part (contract
+//     1.16.0, ut-docs#4300) is taken out before the discount is weighted
+//     and capped and added back after, as core folds it in after the
+//     discount — the part must lie within its band and sum to
+//     `service_charge`, else the sale is refused;
 //   - an employee's tip (TrinkgeldAN, USt-Schlüssel 5) is not the
 //     business's turnover: it goes in the 0%/NULL bucket;
 //   - a tip the business keeps (TrinkgeldAG) is turnover, placed per
@@ -249,15 +253,30 @@ func discountedGrossByRate(req Request, vouchers int64) (map[int]int64, error) {
 	default:
 		inclusive = false
 	}
+	// Contract 1.16.0 (ut-docs#4300): core splits the discount over the
+	// lines before it folds the service charge in, so every figure below
+	// is the band less its charge part, which is added back at the end.
+	// A pre-1.16.0 core sends no charge part: the charge then stays in
+	// the weights, as before (the sum still reconciles).
 	gross := map[int]int64{}
 	net := map[int]int64{}
+	chargeGross := map[int]int64{}
+	var chargeSum int64
 	for _, l := range req.VATBreakdown {
-		g := l.Net + l.Tax
-		if inclusive {
-			g = l.Net
+		if l.ServiceChargeNet < 0 || l.ServiceChargeTax < 0 || l.ServiceChargeNet > l.Net || l.ServiceChargeTax > l.Tax {
+			return nil, fmt.Errorf("%w: service charge part %d/%d at rate %d bp outside its band %d/%d", ErrCannotSign, l.ServiceChargeNet, l.ServiceChargeTax, l.RateBP, l.Net, l.Tax)
 		}
-		gross[l.RateBP] += g
-		net[l.RateBP] += l.Net
+		g, cg := l.Net+l.Tax, l.ServiceChargeNet+l.ServiceChargeTax
+		if inclusive {
+			g, cg = l.Net, l.ServiceChargeNet
+		}
+		gross[l.RateBP] += g - cg
+		net[l.RateBP] += l.Net - l.ServiceChargeNet
+		chargeGross[l.RateBP] += cg
+		chargeSum += l.ServiceChargeNet
+	}
+	if chargeSum != 0 && chargeSum != req.ServiceCharge {
+		return nil, fmt.Errorf("%w: service charge parts sum to %d, service_charge is %d", ErrCannotSign, chargeSum, req.ServiceCharge)
 	}
 	goods, err := goodsGrossByRate(gross, req.VoucherIssues, inclusive)
 	if err != nil {
@@ -301,11 +320,14 @@ func discountedGrossByRate(req Request, vouchers int64) (map[int]int64, error) {
 			if gross[rate] < 0 {
 				// A discount larger than a band's goods (an uncapped
 				// tender discount next to a single-purpose voucher): the
-				// voucher props up total, so the sum check below would
-				// pass. Never sign a negative band.
+				// voucher (or, 1.16.0, the charge) props up total, so the
+				// sum check below would pass. Never sign a negative band.
 				return nil, fmt.Errorf("%w: sale_discount takes rate %d bp below zero", ErrCannotSign, rate)
 			}
 		}
+	}
+	for rate, cg := range chargeGross {
+		gross[rate] += cg
 	}
 	var sum int64
 	for _, g := range gross {
@@ -383,9 +405,9 @@ func apportion(amount int64, gross map[int]int64) (map[int]int64, error) {
 // down, each up to its cap; anything still left (a discount larger than
 // every band's goods) goes on the highest-rate band with weight > 0, so
 // the shares always sum to d — the caller then refuses the negative band.
-// Like the weights, the exclusive cap is read from the payload's net, which
-// already holds the service charge's part (contract 1.5.0); core caps
-// before folding the charge in (§ sale_discount step 1, pre-existing).
+// Like the weights, the exclusive cap is the band's net less its service
+// charge part (contract 1.16.0 § sale_discount step 1, ut-docs#4300) —
+// core caps before folding the charge in.
 func splitSaleDiscount(d int64, weights, caps map[int]int64) (map[int]int64, error) {
 	rates := make([]int, 0, len(weights))
 	var total int64

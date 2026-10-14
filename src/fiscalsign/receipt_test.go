@@ -778,3 +778,136 @@ func TestBuildReceipt_DiscountCapExclusiveExcludesVoucherNet(t *testing.T) {
 		t.Fatalf("VAT = %v, want REDUCED_1 0.07 / NORMAL 1.21", v)
 	}
 }
+
+// Contract 1.16.0 (ut-docs#4300): core splits a sale discount over the
+// goods before it folds the service charge in (pos.VATBandsForSale, the Z
+// report), so the signer takes each band's charge part out before
+// weighting and capping. Both payloads are buildFiscalSignPayload's output
+// for 10.00 @19% + one line @7%, a 1.00 service charge and 1.00 off; the
+// expected bands are VATBandsForSale's for the same sale. Weighting by the
+// payload's gross (v0.12.2) put one cent more on one rate and less on the
+// other.
+func TestBuildReceipt_DiscountWeightsExcludeServiceCharge(t *testing.T) {
+	for _, tc := range []struct {
+		name              string
+		req               Request
+		reduced, standard string
+	}{
+		{
+			// 5.00 @7%: goods gross 5.35 / 11.90, share 0.31 (was 0.30).
+			name: "exclusive",
+			req: Request{
+				Total:         1740,
+				TaxInclusive:  boolPtr(false),
+				SaleDiscount:  100,
+				ServiceCharge: 100,
+				Payments:      []Payment{{Method: "cash", Amount: 1740}},
+				VATBreakdown: []VATLine{
+					{RateBP: 700, Net: 533, Tax: 37, ServiceChargeNet: 33, ServiceChargeTax: 2},
+					{RateBP: 1900, Net: 1067, Tax: 203, ServiceChargeNet: 67, ServiceChargeTax: 13},
+				},
+			},
+			reduced: "5.39", standard: "12.01",
+		},
+		{
+			// 4.26 @7%: goods gross 4.26 / 10.00, share 0.29 (was 0.30).
+			name: "inclusive",
+			req: Request{
+				Total:         1426,
+				TaxInclusive:  boolPtr(true),
+				SaleDiscount:  100,
+				ServiceCharge: 100,
+				Payments:      []Payment{{Method: "cash", Amount: 1426}},
+				VATBreakdown: []VATLine{
+					{RateBP: 700, Net: 458, Tax: 30, ServiceChargeNet: 32, ServiceChargeTax: 2},
+					{RateBP: 1900, Net: 1068, Tax: 171, ServiceChargeNet: 68, ServiceChargeTax: 11},
+				},
+			},
+			reduced: "4.29", standard: "9.97",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			v := vatMap(mustBuild(t, tc.req, Options{}))
+			if v["REDUCED_1"] != tc.reduced || v["NORMAL"] != tc.standard {
+				t.Fatalf("VAT = %v, want REDUCED_1 %s / NORMAL %s (core's VATBandsForSale)", v, tc.reduced, tc.standard)
+			}
+		})
+	}
+}
+
+// A charge taxed at a flat rate (charge.policy.ask service_charge_tax_basis_bp)
+// can make a band that holds nothing but the charge. It has no goods, so
+// it takes no share of the discount, the same as in core.
+func TestBuildReceipt_ChargeOnlyBandTakesNoDiscount(t *testing.T) {
+	// 5.00 @7% (tax 0.35) + a 1.00 charge at a flat 19% (tax 0.19), 0.50 off:
+	// total = 6.00 − 0.50 + 0.54 = 6.04.
+	v := vatMap(mustBuild(t, Request{
+		Total:         604,
+		TaxInclusive:  boolPtr(false),
+		SaleDiscount:  50,
+		ServiceCharge: 100,
+		Payments:      []Payment{{Method: "cash", Amount: 604}},
+		VATBreakdown: []VATLine{
+			{RateBP: 700, Net: 500, Tax: 35},
+			{RateBP: 1900, Net: 100, Tax: 19, ServiceChargeNet: 100, ServiceChargeTax: 19},
+		},
+	}, Options{}))
+	if v["REDUCED_1"] != "4.85" || v["NORMAL"] != "1.19" {
+		t.Fatalf("VAT = %v, want REDUCED_1 4.85 / NORMAL 1.19", v)
+	}
+}
+
+// A pre-1.16.0 core sends no charge part: the signer weights by the
+// payload's gross as before (the sum reconciles). Refusing the tender
+// over a possible one-cent split difference would be worse.
+func TestBuildReceipt_NoChargePartKeepsPayloadWeights(t *testing.T) {
+	v := vatMap(mustBuild(t, Request{
+		Total:         1740,
+		TaxInclusive:  boolPtr(false),
+		SaleDiscount:  100,
+		ServiceCharge: 100,
+		Payments:      []Payment{{Method: "cash", Amount: 1740}},
+		VATBreakdown: []VATLine{
+			{RateBP: 700, Net: 533, Tax: 37},
+			{RateBP: 1900, Net: 1067, Tax: 203},
+		},
+	}, Options{}))
+	if v["REDUCED_1"] != "5.40" || v["NORMAL"] != "12.00" {
+		t.Fatalf("VAT = %v, want the v0.12.2 split 5.40 / 12.00", v)
+	}
+}
+
+// A charge part the payload contradicts is refused, never signed around:
+// negative, larger than its band, or not summing to service_charge.
+func TestBuildReceipt_RefusesInconsistentChargePart(t *testing.T) {
+	base := func(lines ...VATLine) Request {
+		return Request{
+			Total:         1740,
+			TaxInclusive:  boolPtr(false),
+			SaleDiscount:  100,
+			ServiceCharge: 100,
+			Payments:      []Payment{{Method: "cash", Amount: 1740}},
+			VATBreakdown:  lines,
+		}
+	}
+	for name, req := range map[string]Request{
+		"negative": base(
+			VATLine{RateBP: 700, Net: 533, Tax: 37, ServiceChargeNet: -33, ServiceChargeTax: 2},
+			VATLine{RateBP: 1900, Net: 1067, Tax: 203, ServiceChargeNet: 133, ServiceChargeTax: 13}),
+		"larger than band": base(
+			VATLine{RateBP: 700, Net: 533, Tax: 37, ServiceChargeNet: 600, ServiceChargeTax: 2},
+			VATLine{RateBP: 1900, Net: 1067, Tax: 203, ServiceChargeNet: 67, ServiceChargeTax: 13}),
+		"tax larger than band": base(
+			VATLine{RateBP: 700, Net: 533, Tax: 37, ServiceChargeNet: 33, ServiceChargeTax: 40},
+			VATLine{RateBP: 1900, Net: 1067, Tax: 203, ServiceChargeNet: 67, ServiceChargeTax: 13}),
+		"sum differs": base(
+			VATLine{RateBP: 700, Net: 533, Tax: 37, ServiceChargeNet: 33, ServiceChargeTax: 2},
+			VATLine{RateBP: 1900, Net: 1067, Tax: 203, ServiceChargeNet: 60, ServiceChargeTax: 13}),
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := BuildReceipt(req, Options{}); !errors.Is(err, ErrCannotSign) {
+				t.Fatalf("want ErrCannotSign, got %v", err)
+			}
+		})
+	}
+}

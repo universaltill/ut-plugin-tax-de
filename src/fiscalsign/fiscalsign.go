@@ -61,12 +61,18 @@ type Payment struct {
 }
 
 // VATLine is one rate bucket of the sale, already aggregated by core.
-// Net is after line-level discounts but before sale-level
-// discount/service charge.
+// Net is after line-level discounts but before the sale-level discount;
+// since contract 1.5.0 it includes the service charge's apportioned part.
 type VATLine struct {
 	RateBP int   `json:"rate_bp"`
 	Net    int64 `json:"net"`
 	Tax    int64 `json:"tax"`
+	// ServiceChargeNet / ServiceChargeTax (contract 1.16.0, ut-docs#4300)
+	// are the part of Net/Tax that is the service charge, in the same
+	// pricing-mode reading as Net/Tax. Zero from an older core, which
+	// sends no charge part.
+	ServiceChargeNet int64 `json:"service_charge_net"`
+	ServiceChargeTax int64 `json:"service_charge_tax"`
 }
 
 // Voucher purposes core sends in `voucher_issues` (contract 1.14.0,
@@ -86,7 +92,7 @@ type VoucherIssue struct {
 }
 
 // Request is the `fiscal.sign.ask` payload (contract v1.1.0+, currently
-// tracking v1.15.0). Money is in integer minor units throughout.
+// tracking v1.16.0). Money is in integer minor units throughout.
 type Request struct {
 	SaleID       string    `json:"sale_id"`
 	Currency     string    `json:"currency"`
