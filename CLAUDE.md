@@ -62,7 +62,7 @@ round-trips per sale). Core now owns the whole failure surface properly
 (`fiscalsign.BuildReceipt`, ut-docs#833). fiskaly renders `standard_v1`
 into DSFinV-K's `Beleg^<gross per VAT rate>^<per payment type>`, whose
 halves must be equal. A whole-bill discount is split across rates by goods
-gross — a single-purpose voucher takes no share, contract 1.14.1 (Rabatt); an employee tip goes in `NULL` (TrinkgeldAN); a business tip
+gross — a single-purpose voucher takes no share, contract 1.14.1; each share capped at its band's goods, contract 1.15.0 (Rabatt); an employee tip goes in `NULL` (TrinkgeldAN); a business tip
 follows the `tip_business_vat_treatment` setting (TrinkgeldAG); service
 charge is already in `vat_breakdown`. Anything else that doesn't reconcile
 answers **`cannot-sign`** — a TSE signature is irreversible. Don't add a

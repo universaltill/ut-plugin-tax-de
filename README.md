@@ -408,8 +408,12 @@ researched (with sources) on ut-docs#833:
 
 - **Whole-bill discount** (DSFinV-K `Rabatt`, UStAE 10.3): split across the
   sale's VAT rates in proportion to each rate's **goods** gross — floors,
-  remainder on the highest rate carrying goods — the contract's and core's
-  own `pos.VATBandsForSale` convention. Since v0.12.1 (contract 1.14.1,
+  each capped at the band's goods (gross inclusive, net exclusive), the
+  leftover cents filling the bands from the highest rate down up to their
+  caps — the contract's and core's own `pos.VATBandsForSale` convention.
+  Since v0.12.2 (contract 1.15.0, ut-docs#4282) the cap stops a near-total
+  discount over a tiny-goods top band from signing (or, under v0.12.1,
+  refusing) a split that differs from the till's Z report. Since v0.12.1 (contract 1.14.1,
   ut-docs#4240) a single-purpose voucher sold in the same sale is not goods:
   it takes no share and keeps the gross it was issued with, so the signed
   split matches the till's receipt, invoice and Z report. A sale with no

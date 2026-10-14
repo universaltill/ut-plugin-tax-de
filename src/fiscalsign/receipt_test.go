@@ -709,3 +709,72 @@ func TestBuildReceipt_RefusesDiscountTakingGoodsBandNegative(t *testing.T) {
 		t.Fatalf("want ErrCannotSign, got %v", err)
 	}
 }
+
+// Contract 1.15.0 (ut-docs#4277, #4282): each band's share is capped at the
+// goods it comes off and the leftover minor units fill the bands from the
+// highest rate down, each up to its cap — core's pos.splitSaleDiscount.
+// Before, the whole remainder went on the highest band carrying goods and
+// a tiny-goods top band ended at −0.01 (the sum still matched total).
+func TestBuildReceipt_DiscountShareCappedAtGoodsInclusive(t *testing.T) {
+	// goods 1.00 @7%, 2.00 @10.7%, 0.01 @19%, 3.00 off:
+	// floors 99 / 199 / 0, leftover 2 → 19% +1 (cap 1), 10.7% +1 (cap 200).
+	r := mustBuild(t, Request{
+		Total:        1,
+		TaxInclusive: boolPtr(true),
+		SaleDiscount: 300,
+		Payments:     []Payment{{Method: "cash", Amount: 1}},
+		VATBreakdown: []VATLine{
+			{RateBP: 700, Net: 100, Tax: 7},
+			{RateBP: 1070, Net: 200, Tax: 19},
+			{RateBP: 1900, Net: 1, Tax: 0},
+		},
+	}, Options{})
+	// A band left at exactly 0 carries no bucket.
+	if v := vatMap(r); v["REDUCED_1"] != "0.01" || len(v) != 1 {
+		t.Fatalf("VAT = %v, want only REDUCED_1 0.01", v)
+	}
+}
+
+// Exclusive pricing caps a share at the band's goods NET (the discount
+// comes off the net base; tax stays as computed).
+func TestBuildReceipt_DiscountShareCappedAtGoodsExclusive(t *testing.T) {
+	// nets 100 / 200 / 1, taxes 7 / 21 / 0 → gross weights 107 / 221 / 1.
+	// floors 97 / 201→cap 200 / 0, leftover 3 → 19% +1, 10.7% full, 7% +2:
+	// shares 99 / 200 / 1 → gross 8 / 21 / 0. total = 301 − 300 + 28 = 29.
+	r := mustBuild(t, Request{
+		Total:        29,
+		TaxInclusive: boolPtr(false),
+		SaleDiscount: 300,
+		Payments:     []Payment{{Method: "cash", Amount: 29}},
+		VATBreakdown: []VATLine{
+			{RateBP: 700, Net: 100, Tax: 7},
+			{RateBP: 1070, Net: 200, Tax: 21},
+			{RateBP: 1900, Net: 1, Tax: 0},
+		},
+	}, Options{})
+	if v := vatMap(r); v["REDUCED_1"] != "0.08" || v["SPECIAL_RATE_1"] != "0.21" || len(v) != 2 {
+		t.Fatalf("VAT = %v, want REDUCED_1 0.08 / SPECIAL_RATE_1 0.21 only", v)
+	}
+}
+
+// Exclusive pricing with a single-purpose voucher in the same band: the cap
+// is the band's net less the voucher's amount. Old code put 12 on 19% —
+// more than its goods net of 10 — and signed 0.09 / 1.19 against core's
+// 0.07 / 1.21 (no band went negative: the voucher propped it up).
+func TestBuildReceipt_DiscountCapExclusiveExcludesVoucherNet(t *testing.T) {
+	// 7%: goods net 100 tax 7. 19%: goods net 10 tax 2 + voucher net 100
+	// tax 19. weights 107 / (131−119=12), d = 110: floors 98 / 11→cap 10,
+	// leftover 2 → 19% full, 7% +2: shares 100 / 10 → gross 7 / 121.
+	// total = 210 − 110 + 28 = 128.
+	r := mustBuild(t, Request{
+		Total:         128,
+		TaxInclusive:  boolPtr(false),
+		SaleDiscount:  110,
+		Payments:      []Payment{{Method: "cash", Amount: 128}},
+		VATBreakdown:  []VATLine{{RateBP: 700, Net: 100, Tax: 7}, {RateBP: 1900, Net: 110, Tax: 21}},
+		VoucherIssues: []VoucherIssue{{Purpose: VoucherPurposeSingle, Amount: 100, RateBP: 1900}},
+	}, Options{})
+	if v := vatMap(r); v["REDUCED_1"] != "0.07" || v["NORMAL"] != "1.21" {
+		t.Fatalf("VAT = %v, want REDUCED_1 0.07 / NORMAL 1.21", v)
+	}
+}
