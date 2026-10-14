@@ -420,7 +420,14 @@ researched (with sources) on ut-docs#833:
   goods at all falls back to every band's full gross, as core does; a
   discount that would take any band below zero is refused (`cannot-sign`).
 - **Service charge**: already inside `vat_breakdown` (core, contract 1.5.0);
-  never applied twice.
+  never applied twice. Since v0.13.0 (contract 1.16.0, ut-docs#4300) each
+  band's charge part (`service_charge_net`/`service_charge_tax`) is taken
+  out before the whole-bill discount is weighted and capped, then added
+  back — core splits the discount over the goods before folding the charge
+  in, so a sale with both now signs the Z report's exact per-rate split.
+  A core that predates 1.16.0 sends no charge part; the discount is then
+  weighted by the full band gross as before (the sum still reconciles,
+  the split may differ from the Z report by a cent per rate).
 - **Tip to the employee** (`TrinkgeldAN`, USt-Schlüssel 5 — not the
   business's turnover): in the 0% `NULL` bucket. This is the default for a
   tip with no `tip_recipient` (a pre-1.9.0 core), matching core's own

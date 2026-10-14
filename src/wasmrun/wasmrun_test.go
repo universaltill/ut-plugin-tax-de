@@ -687,6 +687,45 @@ func TestFiscalSignAsk_SaleDiscountSignsApportioned(t *testing.T) {
 	}
 }
 
+// Contract 1.16.0 (ut-docs#4300): the band's charge part comes out before
+// the discount is split. The payload is buildFiscalSignPayload's output for
+// 10.00 @19% + 4.26 @7% (inclusive), a 1.00 service charge and 1.00 off;
+// the signed split is core's VATBandsForSale for that sale (9.97 / 4.29),
+// where weighting by the payload's gross gave 9.98 / 4.28.
+func TestFiscalSignAsk_DiscountWithServiceChargeSignsCoreSplit(t *testing.T) {
+	wasm := buildWasm(t)
+	const charged = `{
+	  "type": "fiscal.sign.ask",
+	  "payload": {
+	    "sale_id": "sale-disc-charge",
+	    "currency": "EUR",
+	    "total": 1426,
+	    "tax_inclusive": true,
+	    "sale_discount": 100,
+	    "service_charge": 100,
+	    "payments": [{"method": "cash", "amount": 1426}],
+	    "vat_breakdown": [
+	      {"rate_bp": 700, "net": 458, "tax": 30, "service_charge_net": 32, "service_charge_tax": 2},
+	      {"rate_bp": 1900, "net": 1068, "tax": 171, "service_charge_net": 68, "service_charge_tax": 11}
+	    ]
+	  }
+	}`
+	out, h := run(t, wasm, configuredHost(scriptedFiskaly(t)), charged)
+	if s := statusOf(t, out, h); s != "approved" {
+		t.Fatalf("status = %q, want approved (logs: %v)", s, h.logs)
+	}
+	body := strings.ReplaceAll(h.calls[2].Body(), " ", "")
+	for _, want := range []string{
+		`{"vat_rate":"NORMAL","amount":"9.97"}`,
+		`{"vat_rate":"REDUCED_1","amount":"4.29"}`,
+		`{"payment_type":"CASH","amount":"14.26"}`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("finish body missing %s\nbody: %s", want, body)
+		}
+	}
+}
+
 // The evidence core renders on a §6 receipt must be complete and correctly
 // formatted — a raw Unix epoch would print as "TSE transaction end:
 // 1755253862" to a customer and a tax auditor.
