@@ -510,6 +510,63 @@ commit_change
 assert_fail_containing "source file renamed out of src/, no bump" \
     "src/fiscalsign/fiscalsign.go" "FAIL"
 
+# --- case 20 (ut-docs#4484): first PR of a new repo, no manifest.json at the
+# merge-base -> PASS. A new plugin repo starts with a commit that holds no
+# manifest (licence, ignore rules, review record); the first PR adds it.
+fresh_repo
+(cd "$case_dir" && git rm -q manifest.json && git commit -q -m "repo start: no manifest yet")
+base_sha=$(cd "$case_dir" && git rev-parse HEAD)
+(cd "$case_dir" && git checkout -q HEAD~1 -- manifest.json)
+echo "first release" >>"${case_dir}/README.md"
+commit_change
+assert_pass "first PR: no manifest.json at the merge-base"
+
+# --- case 21 (ut-docs#4484): the first-release path still refuses a version
+# that is already tagged -- the same silent never-ships failure.
+fresh_repo
+first_version=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["version"])' "${case_dir}/manifest.json")
+(cd "$case_dir" && git rm -q manifest.json && git commit -q -m "repo start: no manifest yet" && git tag "v${first_version}")
+base_sha=$(cd "$case_dir" && git rev-parse HEAD)
+(cd "$case_dir" && git checkout -q HEAD~1 -- manifest.json)
+echo "first release" >>"${case_dir}/README.md"
+commit_change
+assert_fail_containing "first PR: version already tagged" "FAIL" "v${first_version}" "ALREADY TAGGED"
+
+# --- case 22 (ut-docs#4484): manifest.json present at the merge-base but
+# unparseable -> FAIL. Only a genuinely ABSENT manifest is a first release.
+fresh_repo
+echo '{ not json' >"${case_dir}/manifest.json"
+(cd "$case_dir" && git add -A && git commit -q -m "broken manifest")
+base_sha=$(cd "$case_dir" && git rev-parse HEAD)
+(cd "$case_dir" && git checkout -q HEAD~1 -- manifest.json)
+echo "change" >>"${case_dir}/README.md"
+commit_change
+assert_fail_containing "unparseable base manifest still fails closed" "could not read manifest.json version at merge-base"
+
+# --- case 23 (ut-docs#4484): stale branch forked before the first manifest
+# -> FAIL. main has since shipped manifest.json (deliberately untagged, so
+# only the stale-branch check can reject it); a branch forked from the
+# pre-manifest commit must not ride the first-release exemption.
+fresh_repo
+(cd "$case_dir" && git rm -q manifest.json && git commit -q -m "repo start: no manifest yet")
+fork=$(cd "$case_dir" && git rev-parse HEAD)
+(cd "$case_dir" && git checkout -q HEAD~1 -- manifest.json && git commit -q -m "first release")
+base_sha=$(cd "$case_dir" && git rev-parse HEAD)
+(cd "$case_dir" && git checkout -q -b stale "$fork" && git checkout -q "$base_sha" -- manifest.json)
+echo "later change" >>"${case_dir}/README.md"
+commit_change
+assert_fail_containing "stale branch forked before the first manifest" "FAIL" "forked before manifest.json existed"
+
+# --- case 24 (ut-docs#4484): no manifest.json at the merge-base OR the head
+# -> PASS. A new repo's early PR (README, licence) before the manifest
+# exists releases nothing, so there is nothing to bump.
+fresh_repo
+(cd "$case_dir" && git rm -q manifest.json && git commit -q -m "repo start: no manifest yet")
+base_sha=$(cd "$case_dir" && git rev-parse HEAD)
+echo "early docs" >>"${case_dir}/README.md"
+commit_change
+assert_pass "no manifest.json at the merge-base or the head"
+
 if [ "$FAILS" -ne 0 ]; then
     echo ""
     echo "$FAILS case(s) failed."

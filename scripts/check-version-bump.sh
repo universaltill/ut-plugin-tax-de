@@ -142,10 +142,35 @@ except Exception as e:
 '
 }
 
-base_version=$(read_version "$MERGE_BASE") || {
-    echo "ERROR: could not read manifest.json version at merge-base ${MERGE_BASE:0:9}"
-    exit 1
-}
+# A new repo's first PR (ut-docs#2964, ut-docs#4484): the merge-base has no
+# manifest.json at all (the repo started with a licence/review-record
+# commit), so there is no earlier version to bump from -- a first release,
+# not a missing bump. Only a MISSING file takes this path; one that exists
+# but doesn't parse still fails closed below, and the already-tagged check
+# further down still applies, so a first version that was somehow released
+# stays refused. main's tip must lack it too: a branch forked before the
+# first manifest landed would otherwise merge an already-shipped version
+# that never releases. (cat-file can't tell "absent" from "object missing",
+# but CI fetches full history and merge-base above already failed closed if
+# not.) Keep this block identical in every ut-plugin-* copy (ut-docs#4484).
+first_release=0
+if ! git cat-file -e "${MERGE_BASE}:manifest.json" 2>/dev/null; then
+    if git cat-file -e "${BASE_SHA}:manifest.json" 2>/dev/null; then
+        echo "FAIL: this branch forked before manifest.json existed, but ${BASE_SHA:0:9} already has one -- rebase onto it and bump the version"
+        exit 1
+    fi
+    if ! git cat-file -e "${HEAD_SHA}:manifest.json" 2>/dev/null; then
+        echo "ok: no manifest.json at merge-base ${MERGE_BASE:0:9} or head ${HEAD_SHA:0:9} -- nothing releases yet"
+        exit 0
+    fi
+    first_release=1
+    base_version="(none: first release)"
+else
+    base_version=$(read_version "$MERGE_BASE") || {
+        echo "ERROR: could not read manifest.json version at merge-base ${MERGE_BASE:0:9}"
+        exit 1
+    }
+fi
 head_version=$(read_version "$HEAD_SHA") || {
     echo "ERROR: could not read manifest.json version at head ${HEAD_SHA:0:9}"
     exit 1
@@ -186,7 +211,7 @@ else
     suggested="a version higher than ${head_version}"
 fi
 
-if [ "$base_version" = "$head_version" ]; then
+if [ "$first_release" -eq 0 ] && [ "$base_version" = "$head_version" ]; then
     fail_no_bump "shipped file(s) changed but manifest.json's version is still ${head_version}" "$suggested"
 fi
 
