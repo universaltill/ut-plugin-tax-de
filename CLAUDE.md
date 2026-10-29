@@ -349,7 +349,8 @@ Known gaps #5/#6/#7.
   ut-docs#1948). Enforced by `scripts/check-version-bump.sh` (CI job
   `version-bump`, PRs only), with `scripts/check-version-bump.test.sh` as
   its own self-test (run first in the same job). A PR touching only
-  `docs/`/`.github/`/`scripts/` other than `build.sh` is exempt. Never
+  `docs/`/`.github/`/`scripts/` other than `build.sh` and `package.sh` (the
+  packaging recipe, ut-docs#5147) is exempt. Never
   publish by hand — tag `v<version>`.
 - `go test ./...` — now covers `src/datev`, `src/fiskalyparse`,
   `src/fiscalsign`, `src/taxrate`, `src/chargepolicy` and `src/wasmrun` (the last actually
